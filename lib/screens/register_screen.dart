@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:absensi_palmprint_fe/screens/pilih_kelas_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -14,6 +15,8 @@ class RegisterScreen extends StatefulWidget {
 class _RegisterScreenState extends State<RegisterScreen> {
   final _nimController  = TextEditingController();
   final _namaController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool  _obscurePassword    = true;
 
   File? _foto1;
   File? _foto2;
@@ -47,35 +50,48 @@ class _RegisterScreenState extends State<RegisterScreen> {
 
   // ==================== REGISTER ====================
   Future<void> _register() async {
-    // Validasi input
-    if (_nimController.text.isEmpty || _namaController.text.isEmpty) {
-      _showSnackbar('NIM dan nama harus diisi!');
-      return;
-    }
-    if (_foto1 == null || _foto2 == null || _foto3 == null) {
-      _showSnackbar('Semua foto telapak tangan harus diambil!');
-      return;
-    }
-
-    setState(() => _isLoading = true);
-
-    final result = await AuthService.register(
-      nim  : _nimController.text.trim(),
-      nama : _namaController.text.trim(),
-      foto1: _foto1!,
-      foto2: _foto2!,
-      foto3: _foto3!,
-    );
-
-    setState(() => _isLoading = false);
-
-    if (result['success']) {
-      _showSnackbar('Registrasi berhasil! Silakan login.');
-      Navigator.pop(context);
-    } else {
-      _showSnackbar(result['message']);
-    }
+  if (_nimController.text.isEmpty || _namaController.text.isEmpty || _passwordController.text.isEmpty) {
+    _showSnackbar('NIM, nama, dan password harus diisi!');
+    return;
   }
+  if (_passwordController.text.length < 6) {
+    _showSnackbar('Password minimal 6 karakter!');
+    return;
+  }
+  if (_foto1 == null || _foto2 == null || _foto3 == null) {
+    _showSnackbar('Semua foto telapak tangan harus diambil!');
+    return;
+  }
+
+  setState(() => _isLoading = true);
+
+  final result = await AuthService.register(
+    nim      : _nimController.text.trim(),
+    nama     : _namaController.text.trim(),
+    password : _passwordController.text,
+    foto1    : _foto1!,
+    foto2    : _foto2!,
+    foto3    : _foto3!,
+  );
+
+  setState(() => _isLoading = false);
+
+  if (result['success']) {
+    if (!mounted) return;
+    // Setelah register langsung ke pilih kelas
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => PilihKelasScreen(
+          token     : result['token'],
+          mahasiswa : result['mahasiswa'],
+        ),
+      ),
+    );
+  } else {
+    _showSnackbar(result['message']);
+  }
+}
 
   void _showSnackbar(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
@@ -155,6 +171,23 @@ class _RegisterScreenState extends State<RegisterScreen> {
               ),
             ),
             const SizedBox(height: 24),
+
+            const SizedBox(height: 16),
+const Text('Password', style: TextStyle(fontWeight: FontWeight.bold)),
+const SizedBox(height: 8),
+TextField(
+  controller  : _passwordController,
+  obscureText : _obscurePassword,
+  decoration  : InputDecoration(
+    hintText  : 'Minimal 6 karakter',
+    border    : OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+    prefixIcon: const Icon(Icons.lock),
+    suffixIcon: IconButton(
+      icon     : Icon(_obscurePassword ? Icons.visibility : Icons.visibility_off),
+      onPressed: () => setState(() => _obscurePassword = !_obscurePassword),
+    ),
+  ),
+),
 
             // Foto telapak tangan
             const Text(

@@ -2,7 +2,6 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import '../config/api_config.dart';
-import '../models/mahasiswa.dart';
 
 class AuthService {
 
@@ -21,6 +20,7 @@ class AuthService {
       request.fields['nim']      = nim;
       request.fields['nama']     = nama;
       request.fields['password'] = password;
+      request.headers['Accept']  = 'application/json';
 
       request.files.add(await http.MultipartFile.fromPath('foto_1', foto1.path));
       request.files.add(await http.MultipartFile.fromPath('foto_2', foto2.path));
@@ -28,7 +28,12 @@ class AuthService {
 
       var streamedResponse = await request.send();
       var response         = await http.Response.fromStream(streamedResponse);
-      var body             = json.decode(response.body);
+
+      if (response.body.isEmpty) {
+        return {'success': false, 'message': 'Response kosong dari server'};
+      }
+
+      var body = json.decode(response.body);
 
       if (response.statusCode == 201) {
         return {
@@ -57,7 +62,10 @@ class AuthService {
     try {
       final response = await http.post(
         Uri.parse(ApiConfig.login),
-        headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+        headers: {
+          'Content-Type' : 'application/json',
+          'Accept'       : 'application/json',
+        },
         body: json.encode({'nim': nim, 'password': password}),
       );
 
@@ -82,11 +90,37 @@ class AuthService {
     }
   }
 
-  // ==================== DAFTAR KELAS ====================
-  static Future<List<dynamic>> daftarKelas() async {
+  // ==================== DAFTAR JURUSAN ====================
+  static Future<List<dynamic>> daftarJurusan() async {
     try {
       final response = await http.get(
-        Uri.parse(ApiConfig.daftarKelas),
+        Uri.parse(ApiConfig.jurusans),
+        headers: {'Accept': 'application/json'},
+      );
+      return json.decode(response.body);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // ==================== DAFTAR PRODI BY JURUSAN ====================
+  static Future<List<dynamic>> daftarProdi(int jurusanId) async {
+    try {
+      final response = await http.get(
+        Uri.parse(ApiConfig.prodisByJurusan(jurusanId)),
+        headers: {'Accept': 'application/json'},
+      );
+      return json.decode(response.body);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  // ==================== DAFTAR KELAS BY PRODI ====================
+  static Future<List<dynamic>> daftarKelas(int prodiId) async {
+    try {
+      final response = await http.get(
+        Uri.parse(ApiConfig.kelasByProdi(prodiId)),
         headers: {'Accept': 'application/json'},
       );
       return json.decode(response.body);

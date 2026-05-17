@@ -3,11 +3,12 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../services/jadwal_service.dart';
+import 'palm_camera_screen.dart';
 
 class AbsensiScreen extends StatefulWidget {
   final String token;
   final Map<String, dynamic> mahasiswa;
-  final int    sesiAbsensiId;
+  final int sesiAbsensiId;
   final String namaMatkul;
 
   const AbsensiScreen({
@@ -24,8 +25,8 @@ class AbsensiScreen extends StatefulWidget {
 
 class _AbsensiScreenState extends State<AbsensiScreen> {
   File? _foto;
-  bool  _isLoading  = false;
-  bool  _berhasil   = false;
+  bool _isLoading = false;
+  bool _berhasil = false;
   String _pesanHasil = '';
 
   Future<void> _ambilFoto() async {
@@ -35,14 +36,13 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
       return;
     }
 
-    final picker = ImagePicker();
-    final picked = await picker.pickImage(
-      source      : ImageSource.camera,
-      imageQuality: 85,
+    final File? result = await Navigator.push<File>(
+      context,
+      MaterialPageRoute(builder: (_) => const PalmCameraScreen(fotoIndex: 1)),
     );
 
-    if (picked != null) {
-      setState(() => _foto = File(picked.path));
+    if (result != null) {
+      setState(() => _foto = result);
     }
   }
 
@@ -55,14 +55,14 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
     setState(() => _isLoading = true);
 
     final result = await JadwalService.absensi(
-      token        : widget.token,
+      token: widget.token,
       sesiAbsensiId: widget.sesiAbsensiId,
-      foto         : _foto!,
+      foto: _foto!,
     );
 
     setState(() {
-      _isLoading  = false;
-      _berhasil   = result['success'];
+      _isLoading = false;
+      _berhasil = result['success'];
       _pesanHasil = result['message'];
     });
 
@@ -73,7 +73,9 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
         context: context,
         barrierDismissible: false,
         builder: (_) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -112,9 +114,9 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
   }
 
   void _showSnackbar(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -122,25 +124,25 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        title          : const Text('Absensi'),
+        title: const Text('Absensi'),
         backgroundColor: Colors.blue,
         foregroundColor: Colors.white,
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
-        child  : Column(
+        child: Column(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             const SizedBox(height: 16),
 
             // Info matkul
             Container(
-              width     : double.infinity,
-              padding   : const EdgeInsets.all(16),
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color       : Colors.blue.shade50,
+                color: Colors.blue.shade50,
                 borderRadius: BorderRadius.circular(12),
-                border      : Border.all(color: Colors.blue.shade200),
+                border: Border.all(color: Colors.blue.shade200),
               ),
               child: Column(
                 children: [
@@ -148,7 +150,10 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
                   const SizedBox(height: 8),
                   Text(
                     widget.namaMatkul,
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 16,
+                    ),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 4),
@@ -166,15 +171,15 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
             GestureDetector(
               onTap: _isLoading ? null : _ambilFoto,
               child: Container(
-                width : 220,
+                width: 220,
                 height: 220,
                 decoration: BoxDecoration(
-                  border      : Border.all(
+                  border: Border.all(
                     color: _foto != null ? Colors.blue : Colors.grey.shade300,
                     width: 2,
                   ),
                   borderRadius: BorderRadius.circular(20),
-                  color       : Colors.grey.shade50,
+                  color: Colors.grey.shade50,
                 ),
                 child: _foto != null
                     ? ClipRRect(
@@ -184,7 +189,11 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
                     : Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(Icons.back_hand, size: 64, color: Colors.grey.shade400),
+                          Icon(
+                            Icons.back_hand,
+                            size: 64,
+                            color: Colors.grey.shade400,
+                          ),
                           const SizedBox(height: 12),
                           Text(
                             'Tap untuk scan\ntelapak tangan kiri',
@@ -201,7 +210,7 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
             if (_foto != null)
               TextButton.icon(
                 onPressed: _ambilFoto,
-                icon : const Icon(Icons.refresh),
+                icon: const Icon(Icons.refresh),
                 label: const Text('Ambil Ulang'),
               ),
 
@@ -209,25 +218,33 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
 
             // Tombol Absensi
             SizedBox(
-              width : double.infinity,
+              width: double.infinity,
               height: 50,
-              child : ElevatedButton.icon(
+              child: ElevatedButton.icon(
                 onPressed: _isLoading ? null : _absensi,
-                icon : _isLoading
+                icon: _isLoading
                     ? const SizedBox(
-                        width : 20,
+                        width: 20,
                         height: 20,
-                        child : CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                        child: CircularProgressIndicator(
+                          color: Colors.white,
+                          strokeWidth: 2,
+                        ),
                       )
                     : const Icon(Icons.fingerprint),
                 label: Text(
                   _isLoading ? 'Memproses...' : 'Absensi Sekarang',
-                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.blue,
                   foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
               ),
             ),

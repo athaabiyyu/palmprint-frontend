@@ -35,7 +35,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   bool _isTakingPhoto = false;
 
   // GANTI dengan — frame lebih kecil, user harus dekatkan tangan
-  static const double _roiRatio = 0.55;
+  static const double _roiRatio = 0.82;
 
   @override
   void initState() {
@@ -109,18 +109,53 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         return;
       }
 
+      // ── Resize dulu ke maxSize agar tidak terlalu berat ──
       img.Image resized = _resizeKeepAspect(fullImage, maxSize: 1440);
 
+      // ── Crop sesuai kotak overlay ROI ──
+      // Posisi kotak overlay sama persis dengan _ROIPainter:
+      //   boxSize = width * _roiRatio
+      //   left    = (width - boxSize) / 2
+      //   top     = (height - boxSize) / 2 - height * 0.08
+      //
+      // Koordinat ini dalam piksel layar (screen space).
+      // Kita perlu konversi ke piksel gambar (image space).
+
+      final int imgW = resized.width;
+      final int imgH = resized.height;
+
+      // Hitung posisi kotak dalam image space
+      // (proporsi sama dengan screen space karena aspect ratio dijaga)
+      final double boxSize = imgW * _roiRatio;
+      final double left = (imgW - boxSize) / 2;
+      final double top = (imgH - boxSize) / 2 - imgH * 0.08;
+
+      // Clamp agar tidak keluar batas gambar
+      final int cropX = left.clamp(0, imgW - 1).toInt();
+      final int cropY = top.clamp(0, imgH - 1).toInt();
+      final int cropW = boxSize.clamp(1, imgW - cropX).toInt();
+      final int cropH = boxSize.clamp(1, imgH - cropY).toInt();
+
+      // Crop gambar sesuai kotak overlay
+      img.Image cropped = img.copyCrop(
+        resized,
+        x: cropX,
+        y: cropY,
+        width: cropW,
+        height: cropH,
+      );
+
+      // ── Simpan ke temp file ──
       final tempDir = await getTemporaryDirectory();
       final outPath = path.join(
         tempDir.path,
         'palm_full_${widget.fotoIndex}_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
       final outFile = File(outPath);
-      await outFile.writeAsBytes(img.encodeJpg(resized, quality: 88));
+      await outFile.writeAsBytes(img.encodeJpg(cropped, quality: 92));
 
-      // ── DEBUG: simpan salinan ke Documents/palm_debug/ ──
-      await _saveDebugImages(resized, outPath);
+      // ── Debug: simpan salinan ──
+      await _saveDebugImages(cropped, outPath);
 
       if (mounted) {
         Navigator.of(context).pop(outFile);
@@ -196,8 +231,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   img.Image _resizeKeepAspect(img.Image src, {required int maxSize}) {
     final w = src.width;
     final h = src.height;
-    if (w <= maxSize && h <= maxSize)
-      return src; // sudah kecil, tidak perlu resize
+    if (w <= maxSize && h <= maxSize) return src;
 
     final landscape = w >= h;
     final newW = landscape ? maxSize : (maxSize * w / h).round();

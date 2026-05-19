@@ -41,7 +41,7 @@ class AuthService {
           'message'           : body['message'],
           'token'             : body['token'],
           'sudah_pilih_kelas' : body['sudah_pilih_kelas'],
-          'mahasiswa'         : body['data'],
+          'mahasiswa' : body['mahasiswa'] ?? body['data'],
         };
       } else {
         return {

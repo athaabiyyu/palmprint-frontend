@@ -38,7 +38,7 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
 
     final File? result = await Navigator.push<File>(
       context,
-      MaterialPageRoute(builder: (_) => const PalmCameraScreen(fotoIndex: 1)),
+      MaterialPageRoute(builder: (_) => const PalmCameraScreen(fotoIndex: 1, token: '',)),
     );
 
     if (result != null) {

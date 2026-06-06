@@ -37,7 +37,7 @@ class _RegisterScreenState extends State<RegisterScreen> {
     final File? result = await Navigator.push<File>(
       context,
       MaterialPageRoute(
-        builder: (_) => PalmCameraScreen(fotoIndex: index),
+        builder: (_) => PalmCameraScreen(fotoIndex: index, token: '',),
       ),
     );
 

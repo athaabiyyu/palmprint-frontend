@@ -1,27 +1,26 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:absensi_palmprint_fe/config/api_config.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path;
-
-/// Screen kamera khusus dengan overlay panduan ROI telapak tangan.
-/// Crop gambar sesuai kotak panduan SEBELUM dikirim ke backend.
-/// Menyimpan debug crop ke folder lokal untuk debugging.
-///
-/// Cara pakai di register_screen.dart:
-///   final file = await Navigator.push<File>(
-///     context,
-///     MaterialPageRoute(builder: (_) => PalmCameraScreen(fotoIndex: index)),
-///   );
-///   if (file != null) setState(() => _foto1 = file);
+import 'dart:convert';
+import 'dart:async';
+import 'package:http/http.dart' as http;
+import 'dart:math';
 
 class PalmCameraScreen extends StatefulWidget {
   final int fotoIndex;
+  final String token;
 
-  const PalmCameraScreen({super.key, required this.fotoIndex});
+  const PalmCameraScreen({
+    super.key,
+    required this.fotoIndex,
+    required this.token,
+  });
 
   @override
   State<PalmCameraScreen> createState() => _PalmCameraScreenState();
@@ -34,8 +33,11 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   bool _isInitialized = false;
   bool _isTakingPhoto = false;
 
-  // GANTI dengan — frame lebih kecil, user harus dekatkan tangan
-  static const double _roiRatio = 0.82;
+  String? _qualityMessage;
+  bool _qualityOk = false;
+
+  // ✅ Diperbesar dari 0.82 → 0.95 agar MediaPipe di server bisa detect landmark
+  static const double _roiRatio = 0.95;
 
   @override
   void initState() {
@@ -69,7 +71,6 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         return;
       }
 
-      // Pakai kamera belakang
       final backCamera = _cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.back,
         orElse: () => _cameras.first,
@@ -77,7 +78,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 
       _controller = CameraController(
         backCamera,
-        ResolutionPreset.veryHigh, // high = ~1280x720 atau lebih
+        ResolutionPreset.high,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
@@ -92,11 +93,116 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     }
   }
 
+  // =====================================================================
+  // QUALITY GATE — konsisten dengan server (extractor.py)
+  // Semua nilai dikali 255 agar skala sama dengan OpenCV
+  // =====================================================================
+
+  double _computeBlurScore(img.Image image) {
+    final gray = img.grayscale(image);
+    double sum = 0;
+    double sumSq = 0;
+    int count = 0;
+
+    for (int y = 1; y < gray.height - 1; y++) {
+      for (int x = 1; x < gray.width - 1; x++) {
+        // ✅ HAPUS * 255 — getLuminance() sudah return 0–255
+        final center = img.getLuminance(gray.getPixel(x, y)).toDouble();
+        final top = img.getLuminance(gray.getPixel(x, y - 1)).toDouble();
+        final bottom = img.getLuminance(gray.getPixel(x, y + 1)).toDouble();
+        final left = img.getLuminance(gray.getPixel(x - 1, y)).toDouble();
+        final right = img.getLuminance(gray.getPixel(x + 1, y)).toDouble();
+
+        final lap = top + bottom + left + right - 4 * center;
+        sum += lap;
+        sumSq += lap * lap;
+        count++;
+      }
+    }
+
+    if (count == 0) return 0;
+    final mean = sum / count;
+    return (sumSq / count) - (mean * mean);
+  }
+
+  double _computeBrightness(img.Image image) {
+    final gray = img.grayscale(image);
+    double total = 0;
+    final pixels = gray.width * gray.height;
+
+    for (int y = 0; y < gray.height; y++) {
+      for (int x = 0; x < gray.width; x++) {
+        // ✅ HAPUS * 255
+        total += img.getLuminance(gray.getPixel(x, y)).toDouble();
+      }
+    }
+    return total / pixels;
+  }
+
+  double _computeContrast(img.Image image) {
+    final gray = img.grayscale(image);
+    final pixels = gray.width * gray.height;
+    double sum = 0;
+    double sumSq = 0;
+
+    for (int y = 0; y < gray.height; y++) {
+      for (int x = 0; x < gray.width; x++) {
+        // ✅ HAPUS * 255
+        final v = img.getLuminance(gray.getPixel(x, y)).toDouble();
+        sum += v;
+        sumSq += v * v;
+      }
+    }
+
+    final mean = sum / pixels;
+    final variance = (sumSq / pixels) - (mean * mean);
+    return variance > 0 ? sqrt(variance.abs()) : 0;
+  }
+
+  /// Quality gate — return null kalau lolos, return pesan error kalau gagal.
+  /// ✅ Threshold konsisten dengan server (extractor.py check_image_quality)
+  String? _checkQuality(img.Image cropped) {
+    final resized200 = img.copyResize(cropped, width: 200, height: 200);
+
+    final blurScore = _computeBlurScore(resized200);
+    final brightness = _computeBrightness(resized200);
+    final contrast = _computeContrast(resized200);
+
+    // Tampilin di console
+    debugPrint('==========================================');
+    debugPrint('QUALITY GATE DEBUG:');
+    debugPrint('blur     = $blurScore');
+    debugPrint('bright   = $brightness');
+    debugPrint('contrast = $contrast');
+    debugPrint('==========================================');
+    debugPrint('==========================================');
+    debugPrint('fotoIndex    : ${widget.fotoIndex}');
+    debugPrint('blur         : $blurScore');
+    debugPrint('brightness   : $brightness');
+    debugPrint('contrast     : $contrast');
+    debugPrint('==========================================');
+
+    if (blurScore < 5) return 'Foto terlalu blur...';
+    if (brightness < 20) return 'Foto terlalu gelap...';
+    if (brightness > 245) return 'Foto terlalu terang...';
+    if (contrast < 5) return 'Detail tidak terlihat...';
+
+    return null;
+  }
+
+  // =====================================================================
+  // TAKE PHOTO
+  // =====================================================================
+
   Future<void> _takePhoto() async {
     if (_controller == null || !_controller!.value.isInitialized) return;
     if (_isTakingPhoto) return;
 
-    setState(() => _isTakingPhoto = true);
+    setState(() {
+      _isTakingPhoto = true;
+      _qualityMessage = null;
+      _qualityOk = false;
+    });
 
     try {
       final XFile xfile = await _controller!.takePicture();
@@ -109,34 +215,20 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         return;
       }
 
-      // ── Resize dulu ke maxSize agar tidak terlalu berat ──
+      // ── Resize + Crop ──
       img.Image resized = _resizeKeepAspect(fullImage, maxSize: 1440);
-
-      // ── Crop sesuai kotak overlay ROI ──
-      // Posisi kotak overlay sama persis dengan _ROIPainter:
-      //   boxSize = width * _roiRatio
-      //   left    = (width - boxSize) / 2
-      //   top     = (height - boxSize) / 2 - height * 0.08
-      //
-      // Koordinat ini dalam piksel layar (screen space).
-      // Kita perlu konversi ke piksel gambar (image space).
 
       final int imgW = resized.width;
       final int imgH = resized.height;
-
-      // Hitung posisi kotak dalam image space
-      // (proporsi sama dengan screen space karena aspect ratio dijaga)
       final double boxSize = imgW * _roiRatio;
       final double left = (imgW - boxSize) / 2;
       final double top = (imgH - boxSize) / 2 - imgH * 0.08;
 
-      // Clamp agar tidak keluar batas gambar
       final int cropX = left.clamp(0, imgW - 1).toInt();
       final int cropY = top.clamp(0, imgH - 1).toInt();
       final int cropW = boxSize.clamp(1, imgW - cropX).toInt();
       final int cropH = boxSize.clamp(1, imgH - cropY).toInt();
 
-      // Crop gambar sesuai kotak overlay
       img.Image cropped = img.copyCrop(
         resized,
         x: cropX,
@@ -145,17 +237,52 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         height: cropH,
       );
 
-      // ── Simpan ke temp file ──
+      // ── Quality Gate lokal (blur/brightness/contrast) ──
+      final String? qualityError = _checkQuality(cropped);
+      if (qualityError != null) {
+        setState(() {
+          _isTakingPhoto = false;
+          _qualityMessage = qualityError;
+          _qualityOk = false;
+        });
+        return;
+      }
+
+      // ── Simpan sementara untuk validasi ke server ──
       final tempDir = await getTemporaryDirectory();
       final outPath = path.join(
         tempDir.path,
-        'palm_full_${widget.fotoIndex}_${DateTime.now().millisecondsSinceEpoch}.jpg',
+        'palm_${widget.fotoIndex}_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
       final outFile = File(outPath);
       await outFile.writeAsBytes(img.encodeJpg(cropped, quality: 92));
 
-      // ── Debug: simpan salinan ──
-      await _saveDebugImages(cropped, outPath);
+      // ── Validasi ke server (cek tangan terdeteksi) ──
+      setState(() {
+        _qualityMessage = null;
+        _qualityOk = false;
+        // isTakingPhoto tetap true — loading masih jalan
+      });
+
+      final String? serverError = await _validateToServer(outFile);
+
+      if (serverError != null) {
+        // Tangan tidak terdeteksi / error server
+        setState(() {
+          _isTakingPhoto = false;
+          _qualityMessage = serverError;
+          _qualityOk = false;
+        });
+        return;
+      }
+
+      // ── Semua lolos — pop dengan file ──
+      setState(() {
+        _qualityOk = true;
+        _qualityMessage = null;
+      });
+
+      await Future.delayed(const Duration(milliseconds: 400));
 
       if (mounted) {
         Navigator.of(context).pop(outFile);
@@ -166,68 +293,49 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     }
   }
 
-  Future<void> _saveDebugImages(img.Image resized, String outPath) async {
+  /// Kirim foto ke FastAPI untuk validasi MediaPipe
+  /// Return null kalau lolos, return pesan error kalau gagal
+  Future<String?> _validateToServer(File fotoFile) async {
     try {
-      final docDir = await getApplicationDocumentsDirectory();
-      final debugDir = Directory(path.join(docDir.path, 'palm_debug'));
-      if (!await debugDir.exists()) await debugDir.create(recursive: true);
+      final String laravelUrl = widget.token.isEmpty
+          ? '${ApiConfig.baseUrl}/validate-palm-guest' // registrasi
+          : '${ApiConfig.baseUrl}/validate-palm'; // absensi (sudah login)
 
-      final ts = DateTime.now().millisecondsSinceEpoch;
-      final idx = widget.fotoIndex;
+      debugPrint('[Validate] Mengirim ke: $laravelUrl');
 
-      // Simpan gambar yang akan dikirim ke Python (sama persis)
-      final debugFile = File(path.join(debugDir.path, 'foto${idx}_${ts}.jpg'));
-      await debugFile.writeAsBytes(img.encodeJpg(resized, quality: 88));
+      final request = http.MultipartRequest('POST', Uri.parse(laravelUrl));
 
-      // Buat gambar annotated: gambar + info ukuran di pojok
-      img.Image annotated = img.Image.from(resized);
+      // ✅ Tambahkan token auth
+      request.headers['Authorization'] = 'Bearer ${widget.token}';
+      request.headers['Accept'] = 'application/json';
 
-      // Tulis info ukuran di pojok kiri atas (pakai warna putih)
-      img.drawString(
-        annotated,
-        '${resized.width}x${resized.height}px | foto $idx',
-        font: img.arial14,
-        x: 10,
-        y: 10,
-        color: img.ColorRgb8(255, 255, 0),
+      request.files.add(
+        await http.MultipartFile.fromPath('foto', fotoFile.path),
       );
 
-      final annotatedFile = File(
-        path.join(debugDir.path, 'foto${idx}_${ts}_annotated.jpg'),
+      final streamedResponse = await request.send().timeout(
+        const Duration(seconds: 15),
       );
-      await annotatedFile.writeAsBytes(img.encodeJpg(annotated, quality: 85));
+      final response = await http.Response.fromStream(streamedResponse);
 
-      debugPrint('==========================================');
-      debugPrint('DEBUG PALM - Foto $idx tersimpan:');
-      debugPrint('  Ukuran    : ${resized.width} x ${resized.height} px');
-      debugPrint('  Dikirim ke: $outPath');
-      debugPrint('  Debug copy: ${debugFile.path}');
-      debugPrint('  Annotated : ${annotatedFile.path}');
-      debugPrint('  Semua file: ${debugDir.path}');
-      debugPrint('==========================================');
+      debugPrint('[Validate] Status: ${response.statusCode}');
+      debugPrint('[Validate] Body: ${response.body}');
 
-      // Tampilkan snackbar info path (hanya di debug mode)
-      assert(() {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(
-                'Debug: ${resized.width}x${resized.height}px\n'
-                'Saved: ${debugDir.path}',
-              ),
-              duration: const Duration(seconds: 4),
-              backgroundColor: Colors.blueGrey,
-            ),
-          );
-        }
-        return true;
-      }());
+      final data = jsonDecode(response.body);
+
+      if (data['valid'] == true) {
+        return null; // lolos
+      } else {
+        return data['message'] ?? 'Foto tidak valid. Coba lagi.';
+      }
+    } on TimeoutException {
+      return 'Koneksi timeout. Periksa jaringan.';
     } catch (e) {
-      debugPrint('Gagal simpan debug image: $e');
+      debugPrint('[Validate] ERROR: $e');
+      return 'Gagal validasi foto. Periksa koneksi.';
     }
   }
 
-  /// Resize gambar agar sisi terpanjang = maxSize, proporsi tetap
   img.Image _resizeKeepAspect(img.Image src, {required int maxSize}) {
     final w = src.width;
     final h = src.height;
@@ -241,34 +349,8 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
       src,
       width: newW,
       height: newH,
-      interpolation: img.Interpolation.cubic,
+      interpolation: img.Interpolation.linear,
     );
-  }
-
-  /// Helper: gambar kotak outline di Image
-  void _drawRect(
-    img.Image image,
-    int x1,
-    int y1,
-    int x2,
-    int y2,
-    img.Color color, {
-    int thickness = 2,
-  }) {
-    for (int t = 0; t < thickness; t++) {
-      // Top & bottom
-      for (int x = x1; x <= x2; x++) {
-        if (y1 + t < image.height && x < image.width)
-          image.setPixel(x, y1 + t, color);
-        if (y2 - t >= 0 && x < image.width) image.setPixel(x, y2 - t, color);
-      }
-      // Left & right
-      for (int y = y1; y <= y2; y++) {
-        if (x1 + t < image.width && y < image.height)
-          image.setPixel(x1 + t, y, color);
-        if (x2 - t >= 0 && y < image.height) image.setPixel(x2 - t, y, color);
-      }
-    }
   }
 
   void _showError(String msg) {
@@ -278,7 +360,10 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.red));
   }
 
-  // ==================== BUILD ====================
+  // =====================================================================
+  // BUILD
+  // =====================================================================
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -332,21 +417,95 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                         textAlign: TextAlign.center,
                       ),
                     ),
-                    const SizedBox(width: 48), // balance back button
+                    const SizedBox(width: 48),
                   ],
                 ),
               ),
             ),
 
-            // ── Instruksi di bawah kotak ──
+            // ── Quality Gate Feedback ──
+            if (_isInitialized && (_qualityMessage != null || _qualityOk))
+              Positioned(
+                top: 80,
+                left: 16,
+                right: 16,
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 300),
+                  child: _qualityMessage != null
+                      ? Container(
+                          key: const ValueKey('error'),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.red.withOpacity(0.9),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: Colors.red.shade300),
+                          ),
+                          child: Row(
+                            children: [
+                              const Icon(
+                                Icons.warning_rounded,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  _qualityMessage!,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    height: 1.4,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        )
+                      : Container(
+                          key: const ValueKey('success'),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 12,
+                          ),
+                          decoration: BoxDecoration(
+                            color: Colors.green.withOpacity(0.9),
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: Colors.green.shade300),
+                          ),
+                          child: const Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                Icons.check_circle_rounded,
+                                color: Colors.white,
+                                size: 20,
+                              ),
+                              SizedBox(width: 8),
+                              Text(
+                                'Foto berhasil diambil!',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                ),
+              ),
+
+            // ── Instruksi ──
             if (_isInitialized)
               Positioned(
-                bottom: 130,
+                bottom: 100,
                 left: 24,
                 right: 24,
                 child: Column(
                   children: [
-                    // Status indicator
                     Container(
                       padding: const EdgeInsets.symmetric(
                         horizontal: 16,
@@ -389,7 +548,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
             // ── Tombol Ambil Foto ──
             if (_isInitialized)
               Positioned(
-                bottom: 32,
+                bottom: 24,
                 left: 0,
                 right: 0,
                 child: Center(
@@ -436,7 +595,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 }
 
 // =====================================================================
-// Custom Painter: overlay gelap di luar ROI + kotak panduan
+// ROI Overlay
 // =====================================================================
 
 class _ROIOverlay extends StatelessWidget {
@@ -463,30 +622,30 @@ class _ROIPainter extends CustomPainter {
     final top = (size.height - boxSize) / 2 - size.height * 0.08;
     final rect = Rect.fromLTWH(left, top, boxSize, boxSize);
 
-    // ── Overlay gelap di luar kotak ──
+    // Overlay gelap di luar kotak
     final overlayPaint = Paint()..color = Colors.black.withOpacity(0.55);
     final fullRect = Rect.fromLTWH(0, 0, size.width, size.height);
-    final path = Path()
+    final overlayPath = Path()
       ..addRect(fullRect)
       ..addRect(rect)
       ..fillType = PathFillType.evenOdd;
-    canvas.drawPath(path, overlayPaint);
+    canvas.drawPath(overlayPath, overlayPaint);
 
-    // ── Border kotak ROI ──
+    // Border kotak
     final borderPaint = Paint()
       ..color = Colors.white
       ..style = PaintingStyle.stroke
       ..strokeWidth = 2.5;
     canvas.drawRect(rect, borderPaint);
 
-    // ── Corner brackets (L-shape di 4 sudut) ──
+    // Corner brackets
     final cornerPaint = Paint()
       ..color = Colors.lightBlueAccent
       ..style = PaintingStyle.stroke
       ..strokeWidth = 4
       ..strokeCap = StrokeCap.round;
 
-    const cLen = 24.0; // panjang tiap bracket
+    const cLen = 24.0;
 
     // Top-left
     canvas.drawLine(Offset(left, top + cLen), Offset(left, top), cornerPaint);
@@ -525,7 +684,7 @@ class _ROIPainter extends CustomPainter {
       cornerPaint,
     );
 
-    // ── Label "ROI" di pojok kiri atas ──
+    // Label
     final textPainter = TextPainter(
       text: const TextSpan(
         text: 'AREA SCAN',

@@ -1,16 +1,15 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'package:absensi_palmprint_fe/config/api_config.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
+import 'package:hand_landmarker/hand_landmarker.dart';
 import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:path/path.dart' as path;
 import 'dart:convert';
 import 'dart:async';
-import 'package:http/http.dart' as http;
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 
 class PalmCameraScreen extends StatefulWidget {
   final int fotoIndex;
@@ -33,23 +32,34 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   bool _isInitialized = false;
   bool _isTakingPhoto = false;
 
+  HandLandmarkerPlugin? _handLandmarker;
+  bool _isDetecting = false;
+  List<Hand>? _detectedHands;
+  bool _handDetected = false;
+
+  final List<double> _palmHHistory = [];
+  static const int _palmHWindowSize = 5;
+
   String? _qualityMessage;
   bool _qualityOk = false;
+  String _palmGuideMessage = 'Arahkan telapak tangan ke kamera...';
 
-  // ✅ Diperbesar dari 0.82 → 0.95 agar MediaPipe di server bisa detect landmark
   static const double _roiRatio = 0.95;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _initHandLandmarker();
     _initCamera();
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _safeStopStream();
     _controller?.dispose();
+    _handLandmarker?.dispose();
     super.dispose();
   }
 
@@ -57,9 +67,57 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (_controller == null || !_controller!.value.isInitialized) return;
     if (state == AppLifecycleState.inactive) {
+      _safeStopStream();
       _controller?.dispose();
     } else if (state == AppLifecycleState.resumed) {
       _initCamera();
+    }
+  }
+
+  void _safeStopStream() {
+    try {
+      if (_controller != null &&
+          _controller!.value.isInitialized &&
+          _controller!.value.isStreamingImages) {
+        _controller!.stopImageStream();
+      }
+    } catch (e) {
+      debugPrint('[Camera] stopImageStream ignored: $e');
+    }
+  }
+
+  Future<void> _safeStartStream() async {
+    try {
+      if (_controller != null &&
+          _controller!.value.isInitialized &&
+          !_controller!.value.isStreamingImages) {
+        await _controller!.startImageStream(_onCameraImage);
+      }
+    } catch (e) {
+      debugPrint('[Camera] startImageStream ignored: $e');
+    }
+  }
+
+  void _initHandLandmarker() {
+    try {
+      _handLandmarker = HandLandmarkerPlugin.create(
+        numHands: 1,
+        minHandDetectionConfidence: 0.6,
+        delegate: HandLandmarkerDelegate.GPU,
+      );
+      debugPrint('[HandLandmarker] ✓ Initialized (GPU)');
+    } catch (e) {
+      debugPrint('[HandLandmarker] ✗ GPU Error: $e');
+      try {
+        _handLandmarker = HandLandmarkerPlugin.create(
+          numHands: 1,
+          minHandDetectionConfidence: 0.5,
+          delegate: HandLandmarkerDelegate.CPU,
+        );
+        debugPrint('[HandLandmarker] ✓ Initialized (CPU fallback)');
+      } catch (e2) {
+        debugPrint('[HandLandmarker] ✗ CPU fallback error: $e2');
+      }
     }
   }
 
@@ -78,12 +136,13 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 
       _controller = CameraController(
         backCamera,
-        ResolutionPreset.high,
+        ResolutionPreset.high, // ← turun dari veryHigh, decode lebih cepat
         enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
+        imageFormatGroup: ImageFormatGroup.yuv420,
       );
 
       await _controller!.initialize();
+      await _safeStartStream();
 
       if (mounted) {
         setState(() => _isInitialized = true);
@@ -93,110 +152,105 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     }
   }
 
-  // =====================================================================
-  // QUALITY GATE — konsisten dengan server (extractor.py)
-  // Semua nilai dikali 255 agar skala sama dengan OpenCV
-  // =====================================================================
+  DateTime _lastDetection = DateTime.now();
+  DateTime _lastSetState = DateTime.now();
 
-  double _computeBlurScore(img.Image image) {
-    final gray = img.grayscale(image);
-    double sum = 0;
-    double sumSq = 0;
-    int count = 0;
+  Future<void> _onCameraImage(CameraImage cameraImage) async {
+    if (_isDetecting || _handLandmarker == null) return;
 
-    for (int y = 1; y < gray.height - 1; y++) {
-      for (int x = 1; x < gray.width - 1; x++) {
-        // ✅ HAPUS * 255 — getLuminance() sudah return 0–255
-        final center = img.getLuminance(gray.getPixel(x, y)).toDouble();
-        final top = img.getLuminance(gray.getPixel(x, y - 1)).toDouble();
-        final bottom = img.getLuminance(gray.getPixel(x, y + 1)).toDouble();
-        final left = img.getLuminance(gray.getPixel(x - 1, y)).toDouble();
-        final right = img.getLuminance(gray.getPixel(x + 1, y)).toDouble();
+    final now = DateTime.now();
+    if (now.difference(_lastDetection).inMilliseconds < 100) return;
+    _lastDetection = now;
 
-        final lap = top + bottom + left + right - 4 * center;
-        sum += lap;
-        sumSq += lap * lap;
-        count++;
+    _isDetecting = true;
+    try {
+      final List<Hand> hands = await Future.microtask(
+        () => _handLandmarker!.detect(
+          cameraImage,
+          _controller!.description.sensorOrientation,
+        ),
+      );
+
+      if (mounted &&
+          DateTime.now().difference(_lastSetState).inMilliseconds > 100) {
+        _lastSetState = DateTime.now();
+        setState(() {
+          _detectedHands = hands;
+          if (hands.isEmpty) {
+            _handDetected = false;
+            _palmGuideMessage = 'Arahkan telapak tangan ke kamera...';
+          } else {
+            final issue = _checkPalmGuide(hands.first);
+            _handDetected = (issue == null);
+            _palmGuideMessage = issue ?? 'Tangan terdeteksi ✓ Siap ambil foto';
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('[Stream] Detection error: $e');
+    } finally {
+      _isDetecting = false;
+    }
+  }
+
+  String? _checkPalmGuide(Hand hand) {
+    final mcpIndices = [5, 9, 13, 17];
+    final mcpXs = mcpIndices.map((i) => hand.landmarks[i].x).toList();
+    final mcpYs = mcpIndices.map((i) => hand.landmarks[i].y).toList();
+
+    final spreadX = mcpXs.reduce(max) - mcpXs.reduce(min);
+    final spreadY = mcpYs.reduce(max) - mcpYs.reduce(min);
+    final spread = max(spreadX, spreadY);
+
+    if (spread < 0.15) return 'Buka jari lebih lebar';
+
+    final wristY = hand.landmarks[0].y;
+    final avgMcpY =
+        mcpIndices.map((i) => hand.landmarks[i].y).reduce((a, b) => a + b) / 4;
+    if (wristY < avgMcpY) return 'Balikkan telapak menghadap kamera';
+
+    final indexTipY = hand.landmarks[8].y;
+    final indexMcpY = hand.landmarks[5].y;
+    final middleTipY = hand.landmarks[12].y;
+    final middleMcpY = hand.landmarks[9].y;
+    if (indexTipY > indexMcpY && middleTipY > middleMcpY) {
+      return 'Luruskan jari-jari tangan';
+    }
+
+    final indexMcpX = hand.landmarks[5].x;
+    final indexMcpYval = hand.landmarks[5].y;
+    final pinkyMcpX = hand.landmarks[17].x;
+    final pinkyMcpY = hand.landmarks[17].y;
+
+    final palmWidth = sqrt(
+      pow(pinkyMcpX - indexMcpX, 2) + pow(pinkyMcpY - indexMcpYval, 2),
+    );
+
+    if (palmWidth >= 0.05) {
+      _palmHHistory.add(palmWidth);
+      if (_palmHHistory.length > _palmHWindowSize) {
+        _palmHHistory.removeAt(0);
       }
     }
 
-    if (count == 0) return 0;
-    final mean = sum / count;
-    return (sumSq / count) - (mean * mean);
-  }
+    final smoothedWidth = _palmHHistory.isNotEmpty
+        ? _palmHHistory.reduce((a, b) => a + b) / _palmHHistory.length
+        : palmWidth;
 
-  double _computeBrightness(img.Image image) {
-    final gray = img.grayscale(image);
-    double total = 0;
-    final pixels = gray.width * gray.height;
+    debugPrint(
+      '[PalmGuide] raw=$palmWidth smoothed=$smoothedWidth spread=$spread wristY=$wristY avgMcpY=$avgMcpY',
+    );
 
-    for (int y = 0; y < gray.height; y++) {
-      for (int x = 0; x < gray.width; x++) {
-        // ✅ HAPUS * 255
-        total += img.getLuminance(gray.getPixel(x, y)).toDouble();
-      }
-    }
-    return total / pixels;
-  }
-
-  double _computeContrast(img.Image image) {
-    final gray = img.grayscale(image);
-    final pixels = gray.width * gray.height;
-    double sum = 0;
-    double sumSq = 0;
-
-    for (int y = 0; y < gray.height; y++) {
-      for (int x = 0; x < gray.width; x++) {
-        // ✅ HAPUS * 255
-        final v = img.getLuminance(gray.getPixel(x, y)).toDouble();
-        sum += v;
-        sumSq += v * v;
-      }
-    }
-
-    final mean = sum / pixels;
-    final variance = (sumSq / pixels) - (mean * mean);
-    return variance > 0 ? sqrt(variance.abs()) : 0;
-  }
-
-  /// Quality gate — return null kalau lolos, return pesan error kalau gagal.
-  /// ✅ Threshold konsisten dengan server (extractor.py check_image_quality)
-  String? _checkQuality(img.Image cropped) {
-    final resized200 = img.copyResize(cropped, width: 200, height: 200);
-
-    final blurScore = _computeBlurScore(resized200);
-    final brightness = _computeBrightness(resized200);
-    final contrast = _computeContrast(resized200);
-
-    // Tampilin di console
-    debugPrint('==========================================');
-    debugPrint('QUALITY GATE DEBUG:');
-    debugPrint('blur     = $blurScore');
-    debugPrint('bright   = $brightness');
-    debugPrint('contrast = $contrast');
-    debugPrint('==========================================');
-    debugPrint('==========================================');
-    debugPrint('fotoIndex    : ${widget.fotoIndex}');
-    debugPrint('blur         : $blurScore');
-    debugPrint('brightness   : $brightness');
-    debugPrint('contrast     : $contrast');
-    debugPrint('==========================================');
-
-    if (blurScore < 5) return 'Foto terlalu blur...';
-    if (brightness < 20) return 'Foto terlalu gelap...';
-    if (brightness > 245) return 'Foto terlalu terang...';
-    if (contrast < 5) return 'Detail tidak terlihat...';
+    if (smoothedWidth > 0.40) return 'Terlalu dekat — mundurkan tangan';
+    if (smoothedWidth < 0.35) return 'Terlalu jauh — dekatkan tangan ke kamera';
 
     return null;
   }
 
-  // =====================================================================
-  // TAKE PHOTO
-  // =====================================================================
-
   Future<void> _takePhoto() async {
     if (_controller == null || !_controller!.value.isInitialized) return;
     if (_isTakingPhoto) return;
+    if (!_handDetected) return;
 
     setState(() {
       _isTakingPhoto = true;
@@ -205,152 +259,67 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     });
 
     try {
+      _safeStopStream();
+      await Future.delayed(const Duration(milliseconds: 100));
+
       final XFile xfile = await _controller!.takePicture();
       final Uint8List rawBytes = await xfile.readAsBytes();
 
-      img.Image? fullImage = img.decodeImage(rawBytes);
-      if (fullImage == null) {
-        _showError('Gagal decode gambar');
-        setState(() => _isTakingPhoto = false);
-        return;
-      }
-
-      // ── Resize + Crop ──
-      img.Image resized = _resizeKeepAspect(fullImage, maxSize: 1440);
-
-      final int imgW = resized.width;
-      final int imgH = resized.height;
-      final double boxSize = imgW * _roiRatio;
-      final double left = (imgW - boxSize) / 2;
-      final double top = (imgH - boxSize) / 2 - imgH * 0.08;
-
-      final int cropX = left.clamp(0, imgW - 1).toInt();
-      final int cropY = top.clamp(0, imgH - 1).toInt();
-      final int cropW = boxSize.clamp(1, imgW - cropX).toInt();
-      final int cropH = boxSize.clamp(1, imgH - cropY).toInt();
-
-      img.Image cropped = img.copyCrop(
-        resized,
-        x: cropX,
-        y: cropY,
-        width: cropW,
-        height: cropH,
-      );
-
-      // ── Quality Gate lokal (blur/brightness/contrast) ──
-      final String? qualityError = _checkQuality(cropped);
-      if (qualityError != null) {
+      if (_detectedHands == null || _detectedHands!.isEmpty) {
+        await _safeStartStream();
         setState(() {
           _isTakingPhoto = false;
-          _qualityMessage = qualityError;
+          _qualityMessage =
+              'Tangan tidak terdeteksi.\nArahkan telapak ke kamera.';
           _qualityOk = false;
         });
         return;
       }
 
-      // ── Simpan sementara untuk validasi ke server ──
+      final hand = _detectedHands!.first;
+      final List<List<double>> lmXY = hand.landmarks
+          .map((lm) => [lm.x, lm.y])
+          .toList();
+
+      final args = _PhotoProcessArgs(
+        rawBytes: rawBytes,
+        landmarkXY: lmXY,
+        sensorOrientation: _controller!.description.sensorOrientation,
+      );
+
+      final result = await compute(_processPhotoInIsolate, args);
+
+      if (result.errorMessage != null) {
+        await _safeStartStream();
+        setState(() {
+          _isTakingPhoto = false;
+          _qualityMessage = result.errorMessage;
+          _qualityOk = false;
+        });
+        return;
+      }
+
+      final Uint8List finalBytes = base64Decode(result.filePath!);
       final tempDir = await getTemporaryDirectory();
       final outPath = path.join(
         tempDir.path,
         'palm_${widget.fotoIndex}_${DateTime.now().millisecondsSinceEpoch}.jpg',
       );
       final outFile = File(outPath);
-      await outFile.writeAsBytes(img.encodeJpg(cropped, quality: 92));
+      await outFile.writeAsBytes(finalBytes);
 
-      // ── Validasi ke server (cek tangan terdeteksi) ──
-      setState(() {
-        _qualityMessage = null;
-        _qualityOk = false;
-        // isTakingPhoto tetap true — loading masih jalan
-      });
-
-      final String? serverError = await _validateToServer(outFile);
-
-      if (serverError != null) {
-        // Tangan tidak terdeteksi / error server
-        setState(() {
-          _isTakingPhoto = false;
-          _qualityMessage = serverError;
-          _qualityOk = false;
-        });
-        return;
-      }
-
-      // ── Semua lolos — pop dengan file ──
       setState(() {
         _qualityOk = true;
         _qualityMessage = null;
       });
 
       await Future.delayed(const Duration(milliseconds: 400));
-
-      if (mounted) {
-        Navigator.of(context).pop(outFile);
-      }
+      if (mounted) Navigator.of(context).pop(outFile);
     } catch (e) {
       _showError('Gagal mengambil foto: $e');
+      await _safeStartStream();
       setState(() => _isTakingPhoto = false);
     }
-  }
-
-  /// Kirim foto ke FastAPI untuk validasi MediaPipe
-  /// Return null kalau lolos, return pesan error kalau gagal
-  Future<String?> _validateToServer(File fotoFile) async {
-    try {
-      final String laravelUrl = widget.token.isEmpty
-          ? '${ApiConfig.baseUrl}/validate-palm-guest' // registrasi
-          : '${ApiConfig.baseUrl}/validate-palm'; // absensi (sudah login)
-
-      debugPrint('[Validate] Mengirim ke: $laravelUrl');
-
-      final request = http.MultipartRequest('POST', Uri.parse(laravelUrl));
-
-      // ✅ Tambahkan token auth
-      request.headers['Authorization'] = 'Bearer ${widget.token}';
-      request.headers['Accept'] = 'application/json';
-
-      request.files.add(
-        await http.MultipartFile.fromPath('foto', fotoFile.path),
-      );
-
-      final streamedResponse = await request.send().timeout(
-        const Duration(seconds: 15),
-      );
-      final response = await http.Response.fromStream(streamedResponse);
-
-      debugPrint('[Validate] Status: ${response.statusCode}');
-      debugPrint('[Validate] Body: ${response.body}');
-
-      final data = jsonDecode(response.body);
-
-      if (data['valid'] == true) {
-        return null; // lolos
-      } else {
-        return data['message'] ?? 'Foto tidak valid. Coba lagi.';
-      }
-    } on TimeoutException {
-      return 'Koneksi timeout. Periksa jaringan.';
-    } catch (e) {
-      debugPrint('[Validate] ERROR: $e');
-      return 'Gagal validasi foto. Periksa koneksi.';
-    }
-  }
-
-  img.Image _resizeKeepAspect(img.Image src, {required int maxSize}) {
-    final w = src.width;
-    final h = src.height;
-    if (w <= maxSize && h <= maxSize) return src;
-
-    final landscape = w >= h;
-    final newW = landscape ? maxSize : (maxSize * w / h).round();
-    final newH = landscape ? (maxSize * h / w).round() : maxSize;
-
-    return img.copyResize(
-      src,
-      width: newW,
-      height: newH,
-      interpolation: img.Interpolation.linear,
-    );
   }
 
   void _showError(String msg) {
@@ -360,10 +329,6 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.red));
   }
 
-  // =====================================================================
-  // BUILD
-  // =====================================================================
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -371,19 +336,37 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
       body: SafeArea(
         child: Stack(
           children: [
-            // ── Camera Preview ──
             if (_isInitialized && _controller != null)
-              Positioned.fill(child: CameraPreview(_controller!))
+              Positioned.fill(
+                child: ClipRect(
+                  child: OverflowBox(
+                    alignment: Alignment.center,
+                    child: FittedBox(
+                      fit: BoxFit.cover,
+                      child: SizedBox(
+                        width: _controller!.value.previewSize!.height,
+                        height: _controller!.value.previewSize!.width,
+                        child: CameraPreview(_controller!),
+                      ),
+                    ),
+                  ),
+                ),
+              )
             else
               const Center(
                 child: CircularProgressIndicator(color: Colors.white),
               ),
 
-            // ── Overlay gelap di luar kotak ROI ──
-            if (_isInitialized)
-              Positioned.fill(child: _ROIOverlay(roiRatio: _roiRatio)),
+            if (_isInitialized && _controller != null)
+              Positioned.fill(
+                child: _ROIOverlay(
+                  roiRatio: _roiRatio,
+                  handDetected: _handDetected,
+                  detectedHands: _detectedHands,
+                  sensorOrientation: _controller!.description.sensorOrientation,
+                ),
+              ),
 
-            // ── Header ──
             Positioned(
               top: 0,
               left: 0,
@@ -423,8 +406,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
               ),
             ),
 
-            // ── Quality Gate Feedback ──
-            if (_isInitialized && (_qualityMessage != null || _qualityOk))
+            if (_isInitialized)
               Positioned(
                 top: 80,
                 left: 16,
@@ -432,73 +414,30 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 300),
                   child: _qualityMessage != null
-                      ? Container(
+                      ? _buildFeedbackBox(
                           key: const ValueKey('error'),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.red.withOpacity(0.9),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.red.shade300),
-                          ),
-                          child: Row(
-                            children: [
-                              const Icon(
-                                Icons.warning_rounded,
-                                color: Colors.white,
-                                size: 20,
-                              ),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  _qualityMessage!,
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 13,
-                                    height: 1.4,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
+                          color: Colors.red,
+                          icon: Icons.warning_rounded,
+                          text: _qualityMessage!,
                         )
-                      : Container(
+                      : _qualityOk
+                      ? _buildFeedbackBox(
                           key: const ValueKey('success'),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.green.withOpacity(0.9),
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.green.shade300),
-                          ),
-                          child: const Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(
-                                Icons.check_circle_rounded,
-                                color: Colors.white,
-                                size: 20,
-                              ),
-                              SizedBox(width: 8),
-                              Text(
-                                'Foto berhasil diambil!',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
-                          ),
+                          color: Colors.green,
+                          icon: Icons.check_circle_rounded,
+                          text: 'Foto berhasil diambil!',
+                        )
+                      : _buildFeedbackBox(
+                          key: ValueKey(_palmGuideMessage),
+                          color: _handDetected ? Colors.green : Colors.orange,
+                          icon: _handDetected
+                              ? Icons.back_hand
+                              : Icons.pan_tool_alt_outlined,
+                          text: _palmGuideMessage,
                         ),
                 ),
               ),
 
-            // ── Instruksi ──
             if (_isInitialized)
               Positioned(
                 bottom: 100,
@@ -545,7 +484,6 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                 ),
               ),
 
-            // ── Tombol Ambil Foto ──
             if (_isInitialized)
               Positioned(
                 bottom: 24,
@@ -553,18 +491,26 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                 right: 0,
                 child: Center(
                   child: GestureDetector(
-                    onTap: _isTakingPhoto ? null : _takePhoto,
+                    onTap: (_isTakingPhoto || !_handDetected)
+                        ? null
+                        : _takePhoto,
                     child: AnimatedContainer(
                       duration: const Duration(milliseconds: 150),
                       width: _isTakingPhoto ? 64 : 72,
                       height: _isTakingPhoto ? 64 : 72,
                       decoration: BoxDecoration(
                         shape: BoxShape.circle,
-                        color: _isTakingPhoto ? Colors.grey : Colors.white,
+                        color: _isTakingPhoto
+                            ? Colors.grey
+                            : _handDetected
+                            ? Colors.white
+                            : Colors.grey.shade600,
                         border: Border.all(color: Colors.white54, width: 4),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.white.withOpacity(0.3),
+                            color: _handDetected
+                                ? Colors.white.withOpacity(0.3)
+                                : Colors.transparent,
                             blurRadius: 12,
                             spreadRadius: 2,
                           ),
@@ -578,9 +524,11 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                                 color: Colors.white,
                               ),
                             )
-                          : const Icon(
+                          : Icon(
                               Icons.camera_alt,
-                              color: Colors.black87,
+                              color: _handDetected
+                                  ? Colors.black87
+                                  : Colors.white54,
                               size: 32,
                             ),
                     ),
@@ -592,6 +540,294 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
       ),
     );
   }
+
+  Widget _buildFeedbackBox({
+    required Key key,
+    required Color color,
+    required IconData icon,
+    required String text,
+  }) {
+    return Container(
+      key: key,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.5)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: Colors.white, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Data class untuk kirim ke isolate ──
+class _PhotoProcessArgs {
+  final Uint8List rawBytes;
+  final List<List<double>> landmarkXY;
+  final int sensorOrientation;
+
+  _PhotoProcessArgs({
+    required this.rawBytes,
+    required this.landmarkXY,
+    required this.sensorOrientation,
+  });
+}
+
+class _PhotoProcessResult {
+  final String? errorMessage;
+  final String? filePath;
+
+  _PhotoProcessResult({this.errorMessage, this.filePath});
+}
+
+// ── Static function: jalan di isolate terpisah ──
+Future<_PhotoProcessResult> _processPhotoInIsolate(
+  _PhotoProcessArgs args,
+) async {
+  // 1. Decode
+  img.Image? fullImage = img.decodeImage(args.rawBytes);
+  if (fullImage == null) {
+    return _PhotoProcessResult(errorMessage: 'Gagal decode gambar');
+  }
+
+  // 2. Resize ke max 1080px
+  img.Image resized = _resizeKeepAspectStatic(fullImage, maxSize: 1080);
+
+  // 3. Crop ROI 200×200 berdasarkan palm center landmark
+  final img.Image? croppedRegion = _cropByLandmarkStatic(
+    resized,
+    args.landmarkXY,
+    args.sensorOrientation,
+  );
+
+  if (croppedRegion == null) {
+    return _PhotoProcessResult(
+      errorMessage:
+          'Gagal membaca area tangan.\nPastikan telapak terlihat jelas.',
+    );
+  }
+
+  // 4. Quality check pada crop
+  final String? qualityError = _checkQualityStatic(croppedRegion);
+  if (qualityError != null) {
+    return _PhotoProcessResult(errorMessage: qualityError);
+  }
+
+  // 5. Pastikan 200×200 grayscale lalu encode JPEG
+  final img.Image roi200 = img.copyResize(
+    croppedRegion,
+    width: 200,
+    height: 200,
+    interpolation: img.Interpolation.linear,
+  );
+  final img.Image roiGray = img.grayscale(roi200);
+  final Uint8List jpegBytes = img.encodeJpg(roiGray, quality: 95) as Uint8List;
+
+  final String b64 = base64Encode(jpegBytes);
+  return _PhotoProcessResult(filePath: b64);
+}
+
+img.Image _resizeKeepAspectStatic(img.Image src, {required int maxSize}) {
+  final w = src.width;
+  final h = src.height;
+  if (w <= maxSize && h <= maxSize) return src;
+  final landscape = w >= h;
+  final newW = landscape ? maxSize : (maxSize * w / h).round();
+  final newH = landscape ? (maxSize * h / w).round() : maxSize;
+  return img.copyResize(
+    src,
+    width: newW,
+    height: newH,
+    interpolation: img.Interpolation.linear,
+  );
+}
+
+img.Image? _cropByLandmarkStatic(
+  img.Image image,
+  List<List<double>> lmXY,
+  int sensorOrientation,
+) {
+  try {
+    final w = image.width.toDouble();
+    final h = image.height.toDouble();
+
+    Offset transformLm(double x, double y) {
+      switch (sensorOrientation) {
+        case 90:
+          return Offset((1.0 - y) * w, x * h);
+        case 270:
+          return Offset(y * w, (1.0 - x) * h);
+        case 180:
+          return Offset((1.0 - x) * w, (1.0 - y) * h);
+        default:
+          return Offset(x * w, y * h);
+      }
+    }
+
+    final wrist = transformLm(lmXY[0][0], lmXY[0][1]);
+    final middleMcp = transformLm(lmXY[9][0], lmXY[9][1]);
+    final indexMcp = transformLm(lmXY[5][0], lmXY[5][1]);
+    final pinkyMcp = transformLm(lmXY[17][0], lmXY[17][1]);
+
+    // ── 1. Hitung angle (sebelum rotasi apapun) ──
+    final dx = middleMcp.dx - wrist.dx;
+    final dy = middleMcp.dy - wrist.dy;
+    double angle = atan2(dx, -dy) * 180 / pi;
+    angle = angle.clamp(-100.0, 100.0);
+    debugPrint('[Crop] Computed angle: $angle');
+
+    // ── 2. Dynamic ROI size dari landmark ASLI (sebelum rotasi) ──
+    final distWristMid = sqrt(pow(dx, 2) + pow(dy, 2));
+    final dynamicSize = (distWristMid * 0.70).clamp(80.0, 200.0);
+
+    // ── 3. Palm center dari landmark ASLI (offset 0.40) ──
+    final vx = pinkyMcp.dx - indexMcp.dx;
+    final vy = pinkyMcp.dy - indexMcp.dy;
+    final palmWidth = sqrt(vx * vx + vy * vy);
+    if (palmWidth < 1) return null;
+
+    final midX = (indexMcp.dx + pinkyMcp.dx) / 2;
+    final midY = (indexMcp.dy + pinkyMcp.dy) / 2;
+
+    var nx = -vy / palmWidth;
+    var ny = vx / palmWidth;
+
+    final wx = wrist.dx - midX;
+    final wy = wrist.dy - midY;
+    if (nx * wx + ny * wy < 0) {
+      nx = -nx;
+      ny = -ny;
+    }
+
+    final offset = palmWidth * 0.40;
+    final pcx = midX + nx * offset;
+    final pcy = midY + ny * offset;
+
+    // ── 4. Crop area BESAR (1.6× dynamicSize) di sekitar palm center ──
+    // Agar telapak tetap masuk meski gambar dirotasi sampai ±25°
+    final bigSize = (dynamicSize * 1.6).clamp(80.0, min(w, h));
+    final bigHalf = bigSize / 2;
+
+    if (w < bigSize || h < bigSize) {
+      debugPrint(
+        '[Crop] Gambar terlalu kecil untuk bigSize=$bigSize: ${w}x${h}',
+      );
+      return null;
+    }
+
+    final bx1 = (pcx - bigHalf).clamp(0.0, w - bigSize);
+    final by1 = (pcy - bigHalf).clamp(0.0, h - bigSize);
+
+    final bigCrop = img.copyCrop(
+      image,
+      x: bx1.toInt(),
+      y: by1.toInt(),
+      width: bigSize.toInt(),
+      height: bigSize.toInt(),
+    );
+
+    // ── 5. Rotasi crop besar (persegi, jadi ambiguitas pivot minim) ──
+    // Asumsi: angle positif → tangan miring ke kanan → perlu rotasi
+    // berlawanan arah jarum jam agar tegak.
+    // img.copyRotate dengan angle positif = searah jarum jam,
+    // jadi pakai -angle agar berlawanan jarum jam.
+    final img.Image rotated = img.copyRotate(bigCrop, angle: -angle);
+
+    // ── 6. Crop tengah dari hasil rotasi ke ukuran dynamicSize ──
+    final rw = rotated.width.toDouble();
+    final rh = rotated.height.toDouble();
+    final half = dynamicSize / 2;
+
+    if (rw < dynamicSize || rh < dynamicSize) {
+      debugPrint('[Crop] Hasil rotasi terlalu kecil: ${rw}x${rh}');
+      return null;
+    }
+
+    final cx1 = (rw / 2 - half).clamp(0.0, rw - dynamicSize);
+    final cy1 = (rh / 2 - half).clamp(0.0, rh - dynamicSize);
+
+    final finalCrop = img.copyCrop(
+      rotated,
+      x: cx1.toInt(),
+      y: cy1.toInt(),
+      width: dynamicSize.toInt(),
+      height: dynamicSize.toInt(),
+    );
+
+    // ── 7. Resize ke 200×200 ──
+    return img.copyResize(
+      finalCrop,
+      width: 200,
+      height: 200,
+      interpolation: img.Interpolation.average,
+    );
+  } catch (e, stack) {
+    debugPrint('[Crop] Error: $e');
+    debugPrint('[Crop] Stack: $stack');
+    return null;
+  }
+}
+
+String? _checkQualityStatic(img.Image cropped) {
+  final gray = img.grayscale(cropped);
+  double sum = 0, sumSq = 0, totalLum = 0, totalSq = 0;
+  int count = 0;
+  final pixels = gray.width * gray.height;
+
+  for (int y = 0; y < gray.height; y++) {
+    for (int x = 0; x < gray.width; x++) {
+      final v = img.getLuminance(gray.getPixel(x, y)).toDouble();
+      totalLum += v;
+      totalSq += v * v;
+      if (x > 0 && x < gray.width - 1 && y > 0 && y < gray.height - 1) {
+        final center = v;
+        final top = img.getLuminance(gray.getPixel(x, y - 1)).toDouble();
+        final bottom = img.getLuminance(gray.getPixel(x, y + 1)).toDouble();
+        final left = img.getLuminance(gray.getPixel(x - 1, y)).toDouble();
+        final right = img.getLuminance(gray.getPixel(x + 1, y)).toDouble();
+        final lap = top + bottom + left + right - 4 * center;
+        sum += lap;
+        sumSq += lap * lap;
+        count++;
+      }
+    }
+  }
+
+  final mean = sum / count;
+  final blurScore = (sumSq / count) - (mean * mean);
+  final brightness = totalLum / pixels;
+  final meanLum = totalLum / pixels;
+  final variance = (totalSq / pixels) - (meanLum * meanLum);
+  final contrast = variance > 0 ? sqrt(variance.abs()) : 0;
+
+  debugPrint(
+    '[Quality] blur=$blurScore brightness=$brightness contrast=$contrast',
+  );
+  if (blurScore < 8)
+    return 'Foto terlalu blur.\nPastikan kamera fokus dan tangan tidak bergerak.';
+  if (brightness < 40)
+    return 'Foto terlalu gelap.\nPindah ke tempat yang lebih terang.';
+  if (brightness > 230)
+    return 'Foto terlalu terang.\nHindari cahaya langsung ke kamera.';
+  if (contrast < 6)
+    return 'Detail telapak tangan tidak terlihat.\nPastikan telapak menghadap kamera.';
+
+  return null;
 }
 
 // =====================================================================
@@ -600,12 +836,26 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 
 class _ROIOverlay extends StatelessWidget {
   final double roiRatio;
-  const _ROIOverlay({required this.roiRatio});
+  final bool handDetected;
+  final List<Hand>? detectedHands;
+  final int sensorOrientation;
+
+  const _ROIOverlay({
+    required this.roiRatio,
+    required this.handDetected,
+    required this.sensorOrientation,
+    this.detectedHands,
+  });
 
   @override
   Widget build(BuildContext context) {
     return CustomPaint(
-      painter: _ROIPainter(roiRatio: roiRatio),
+      painter: _ROIPainter(
+        roiRatio: roiRatio,
+        handDetected: handDetected,
+        detectedHands: detectedHands,
+        sensorOrientation: sensorOrientation,
+      ),
       child: const SizedBox.expand(),
     );
   }
@@ -613,7 +863,29 @@ class _ROIOverlay extends StatelessWidget {
 
 class _ROIPainter extends CustomPainter {
   final double roiRatio;
-  const _ROIPainter({required this.roiRatio});
+  final bool handDetected;
+  final List<Hand>? detectedHands;
+  final int sensorOrientation;
+
+  const _ROIPainter({
+    required this.roiRatio,
+    required this.handDetected,
+    required this.sensorOrientation,
+    this.detectedHands,
+  });
+
+  Offset _transformLandmark(double x, double y, Size size) {
+    switch (sensorOrientation) {
+      case 90:
+        return Offset((1.0 - y) * size.width, x * size.height);
+      case 270:
+        return Offset(y * size.width, (1.0 - x) * size.height);
+      case 180:
+        return Offset((1.0 - x) * size.width, (1.0 - y) * size.height);
+      default:
+        return Offset(x * size.width, y * size.height);
+    }
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -622,35 +894,33 @@ class _ROIPainter extends CustomPainter {
     final top = (size.height - boxSize) / 2 - size.height * 0.08;
     final rect = Rect.fromLTWH(left, top, boxSize, boxSize);
 
-    // Overlay gelap di luar kotak
-    final overlayPaint = Paint()..color = Colors.black.withOpacity(0.55);
-    final fullRect = Rect.fromLTWH(0, 0, size.width, size.height);
     final overlayPath = Path()
-      ..addRect(fullRect)
+      ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
       ..addRect(rect)
       ..fillType = PathFillType.evenOdd;
-    canvas.drawPath(overlayPath, overlayPaint);
+    canvas.drawPath(
+      overlayPath,
+      Paint()..color = Colors.black.withOpacity(0.55),
+    );
 
-    // Border kotak
-    final borderPaint = Paint()
-      ..color = Colors.white
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.5;
-    canvas.drawRect(rect, borderPaint);
+    final borderColor = handDetected ? Colors.greenAccent : Colors.white;
+    canvas.drawRect(
+      rect,
+      Paint()
+        ..color = borderColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.5,
+    );
 
-    // Corner brackets
     final cornerPaint = Paint()
-      ..color = Colors.lightBlueAccent
+      ..color = handDetected ? Colors.greenAccent : Colors.lightBlueAccent
       ..style = PaintingStyle.stroke
       ..strokeWidth = 4
       ..strokeCap = StrokeCap.round;
 
     const cLen = 24.0;
-
-    // Top-left
     canvas.drawLine(Offset(left, top + cLen), Offset(left, top), cornerPaint);
     canvas.drawLine(Offset(left, top), Offset(left + cLen, top), cornerPaint);
-    // Top-right
     canvas.drawLine(
       Offset(left + boxSize - cLen, top),
       Offset(left + boxSize, top),
@@ -661,7 +931,6 @@ class _ROIPainter extends CustomPainter {
       Offset(left + boxSize, top + cLen),
       cornerPaint,
     );
-    // Bottom-left
     canvas.drawLine(
       Offset(left, top + boxSize - cLen),
       Offset(left, top + boxSize),
@@ -672,7 +941,6 @@ class _ROIPainter extends CustomPainter {
       Offset(left + cLen, top + boxSize),
       cornerPaint,
     );
-    // Bottom-right
     canvas.drawLine(
       Offset(left + boxSize - cLen, top + boxSize),
       Offset(left + boxSize, top + boxSize),
@@ -684,12 +952,70 @@ class _ROIPainter extends CustomPainter {
       cornerPaint,
     );
 
-    // Label
+    if (handDetected && detectedHands != null && detectedHands!.isNotEmpty) {
+      final hand = detectedHands!.first;
+      final roiRect = Rect.fromLTWH(left, top, boxSize, boxSize);
+
+      final linePaint = Paint()
+        ..color = Colors.greenAccent.withOpacity(0.5)
+        ..strokeWidth = 1.5
+        ..style = PaintingStyle.stroke;
+
+      final dotPaint = Paint()
+        ..color = Colors.greenAccent
+        ..style = PaintingStyle.fill;
+
+      Offset lmToOffset(landmark) =>
+          _transformLandmark(landmark.x, landmark.y, size);
+      bool isInRoi(Offset p) => roiRect.contains(p);
+
+      final connections = [
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 4],
+        [0, 5],
+        [5, 6],
+        [6, 7],
+        [7, 8],
+        [0, 9],
+        [9, 10],
+        [10, 11],
+        [11, 12],
+        [0, 13],
+        [13, 14],
+        [14, 15],
+        [15, 16],
+        [0, 17],
+        [17, 18],
+        [18, 19],
+        [19, 20],
+        [5, 9],
+        [9, 13],
+        [13, 17],
+      ];
+
+      for (final conn in connections) {
+        final p1 = lmToOffset(hand.landmarks[conn[0]]);
+        final p2 = lmToOffset(hand.landmarks[conn[1]]);
+        if (isInRoi(p1) && isInRoi(p2)) {
+          canvas.drawLine(p1, p2, linePaint);
+        }
+      }
+
+      for (final landmark in hand.landmarks) {
+        final p = lmToOffset(landmark);
+        if (isInRoi(p)) {
+          canvas.drawCircle(p, 4, dotPaint);
+        }
+      }
+    }
+
     final textPainter = TextPainter(
-      text: const TextSpan(
-        text: 'AREA SCAN',
+      text: TextSpan(
+        text: handDetected ? 'TANGAN TERDETEKSI ✓' : 'AREA SCAN',
         style: TextStyle(
-          color: Colors.lightBlueAccent,
+          color: handDetected ? Colors.greenAccent : Colors.lightBlueAccent,
           fontSize: 10,
           fontWeight: FontWeight.bold,
           letterSpacing: 1.5,
@@ -701,5 +1027,9 @@ class _ROIPainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _ROIPainter old) => old.roiRatio != roiRatio;
+  bool shouldRepaint(covariant _ROIPainter old) =>
+      old.roiRatio != roiRatio ||
+      old.handDetected != handDetected ||
+      old.detectedHands != detectedHands ||
+      old.sensorOrientation != sensorOrientation;
 }

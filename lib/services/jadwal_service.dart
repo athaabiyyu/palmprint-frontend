@@ -4,6 +4,7 @@ import 'dart:convert';
 import '../config/api_config.dart';
 
 class JadwalService {
+
   // ==================== JADWAL HARI INI ====================
   static Future<Map<String, dynamic>> jadwalHariIni({
     required String token,
@@ -11,10 +12,7 @@ class JadwalService {
     try {
       final response = await http.get(
         Uri.parse(ApiConfig.jadwalHariIni),
-        headers: {
-          'Accept': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
+        headers: ApiConfig.authHeaders(token),
       );
 
       final body = json.decode(response.body);
@@ -41,25 +39,24 @@ class JadwalService {
     try {
       var request = http.MultipartRequest('POST', Uri.parse(ApiConfig.absensi));
 
-      request.headers['Authorization'] = 'Bearer $token';
-      request.headers['Accept'] = 'application/json';
+      request.headers.addAll(ApiConfig.multipartAuthHeaders(token));
       request.fields['sesi_absensi_id'] = sesiAbsensiId.toString();
       request.files.add(await http.MultipartFile.fromPath('foto', foto.path));
 
       var streamedResponse = await request.send();
-      var response = await http.Response.fromStream(streamedResponse);
-      var body = json.decode(response.body);
+      var response         = await http.Response.fromStream(streamedResponse);
+      var body             = json.decode(response.body);
 
       if (response.statusCode == 200) {
         return {
-          'success': true,
-          'message': body['message'],
-          'similarity': body['similarity'],
+          'success'    : true,
+          'message'    : body['message'],
+          'similarity' : body['similarity'],
         };
       } else {
         return {
-          'success': false,
-          'message': body['message'] ?? 'Absensi gagal',
+          'success' : false,
+          'message' : body['message'] ?? 'Absensi gagal',
         };
       }
     } catch (e) {
@@ -74,10 +71,7 @@ class JadwalService {
     try {
       final response = await http.get(
         Uri.parse(ApiConfig.riwayatAbsensi),
-        headers: {
-          'Accept': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
+        headers: ApiConfig.authHeaders(token),
       );
       final body = json.decode(response.body);
       if (response.statusCode == 200) {
@@ -100,16 +94,12 @@ class JadwalService {
     try {
       final response = await http.post(
         Uri.parse(ApiConfig.uploadSurat),
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Authorization': 'Bearer $token',
-        },
+        headers: ApiConfig.authJsonHeaders(token),
         body: json.encode({
-          'sesi_absensi_id': sesiAbsensiId,
-          'jenis': jenis,
-          'link_drive': linkDrive,
-          'keterangan': keterangan,
+          'sesi_absensi_id' : sesiAbsensiId,
+          'jenis'           : jenis,
+          'link_drive'      : linkDrive,
+          'keterangan'      : keterangan,
         }),
       );
       final body = json.decode(response.body);
@@ -117,8 +107,8 @@ class JadwalService {
         return {'success': true, 'message': body['message']};
       }
       return {
-        'success': false,
-        'message': body['message'] ?? 'Gagal upload surat',
+        'success' : false,
+        'message' : body['message'] ?? 'Gagal upload surat',
       };
     } catch (e) {
       return {'success': false, 'message': 'Koneksi gagal: $e'};

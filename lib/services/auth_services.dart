@@ -20,7 +20,7 @@ class AuthService {
       request.fields['nim']      = nim;
       request.fields['nama']     = nama;
       request.fields['password'] = password;
-      request.headers['Accept']  = 'application/json';
+      request.headers.addAll(ApiConfig.multipartHeaders);
 
       request.files.add(await http.MultipartFile.fromPath('foto_1', foto1.path));
       request.files.add(await http.MultipartFile.fromPath('foto_2', foto2.path));
@@ -41,7 +41,7 @@ class AuthService {
           'message'           : body['message'],
           'token'             : body['token'],
           'sudah_pilih_kelas' : body['sudah_pilih_kelas'],
-          'mahasiswa' : body['mahasiswa'] ?? body['data'],
+          'mahasiswa'         : body['mahasiswa'] ?? body['data'],
         };
       } else {
         return {
@@ -62,10 +62,7 @@ class AuthService {
     try {
       final response = await http.post(
         Uri.parse(ApiConfig.login),
-        headers: {
-          'Content-Type' : 'application/json',
-          'Accept'       : 'application/json',
-        },
+        headers: ApiConfig.jsonHeaders,
         body: json.encode({'nim': nim, 'password': password}),
       );
 
@@ -95,7 +92,7 @@ class AuthService {
     try {
       final response = await http.get(
         Uri.parse(ApiConfig.jurusans),
-        headers: {'Accept': 'application/json'},
+        headers: ApiConfig.baseHeaders,
       );
       return json.decode(response.body);
     } catch (e) {
@@ -108,7 +105,7 @@ class AuthService {
     try {
       final response = await http.get(
         Uri.parse(ApiConfig.prodisByJurusan(jurusanId)),
-        headers: {'Accept': 'application/json'},
+        headers: ApiConfig.baseHeaders,
       );
       return json.decode(response.body);
     } catch (e) {
@@ -121,7 +118,7 @@ class AuthService {
     try {
       final response = await http.get(
         Uri.parse(ApiConfig.kelasByProdi(prodiId)),
-        headers: {'Accept': 'application/json'},
+        headers: ApiConfig.baseHeaders,
       );
       return json.decode(response.body);
     } catch (e) {
@@ -137,11 +134,7 @@ class AuthService {
     try {
       final response = await http.post(
         Uri.parse(ApiConfig.pilihKelas),
-        headers: {
-          'Content-Type'  : 'application/json',
-          'Accept'        : 'application/json',
-          'Authorization' : 'Bearer $token',
-        },
+        headers: ApiConfig.authJsonHeaders(token),
         body: json.encode({'kelas_id': kelasId}),
       );
 

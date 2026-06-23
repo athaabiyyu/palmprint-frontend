@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:ui' as ui;
+import 'package:absensi_palmprint_fe/roi_crop_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:hand_landmarker/hand_landmarker.dart';
@@ -38,6 +39,10 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   bool _handDetected = false;
 
   final List<double> _palmHHistory = [];
+
+  final List<List<List<double>>> _landmarkHistory = [];
+  static const int _landmarkWindowSize = 8;
+
   static const int _palmHWindowSize = 5;
 
   String? _qualityMessage;
@@ -176,13 +181,28 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         _lastSetState = DateTime.now();
         setState(() {
           _detectedHands = hands;
-          if (hands.isEmpty) {
-            _handDetected = false;
-            _palmGuideMessage = 'Arahkan telapak tangan ke kamera...';
-          } else {
+          if (hands.isNotEmpty) {
+            // Simpan landmark ke history
+            final lmXY = hands.first.landmarks
+                .map((lm) => [lm.x, lm.y])
+                .toList();
+            _landmarkHistory.add(lmXY);
+            if (_landmarkHistory.length > _landmarkWindowSize) {
+              _landmarkHistory.removeAt(0);
+            }
+            debugPrint(
+              '[Smooth] landmark pushed, size=${_landmarkHistory.length}',
+            );
+
             final issue = _checkPalmGuide(hands.first);
             _handDetected = (issue == null);
             _palmGuideMessage = issue ?? 'Tangan terdeteksi ✓ Siap ambil foto';
+          } else {
+            if (hands.isEmpty) {
+              _handDetected = false;
+              // HAPUS: _landmarkHistory.clear(); ← ini penyebabnya
+              _palmGuideMessage = 'Arahkan telapak tangan ke kamera...';
+            }
           }
         });
       }
@@ -193,44 +213,89 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     }
   }
 
-  String? _checkPalmGuide(Hand hand) {
-    final mcpIndices = [5, 9, 13, 17];
-    final mcpXs = mcpIndices.map((i) => hand.landmarks[i].x).toList();
-    final mcpYs = mcpIndices.map((i) => hand.landmarks[i].y).toList();
+  List<List<double>> _getSmoothedLandmarks() {
+    if (_landmarkHistory.isEmpty) return [];
 
+    final n = _landmarkHistory.length;
+    final numPoints = _landmarkHistory.first.length;
+
+    // Frame terbaru dapat bobot lebih besar
+    final weights = List.generate(n, (i) => (i + 1).toDouble());
+    final totalWeight = weights.reduce((a, b) => a + b);
+
+    return List.generate(numPoints, (i) {
+      double avgX = 0, avgY = 0;
+      for (int f = 0; f < n; f++) {
+        avgX += _landmarkHistory[f][i][0] * weights[f];
+        avgY += _landmarkHistory[f][i][1] * weights[f];
+      }
+      return [avgX / totalWeight, avgY / totalWeight];
+    });
+  }
+
+  String? _checkPalmGuide(Hand hand) {
+    // Ambil sensor orientation dari controller
+    final so = _controller!.description.sensorOrientation;
+
+    // Helper transform — sama persis dengan yang di crop
+    Offset transformLm(double x, double y) {
+      switch (so) {
+        case 90:
+          return Offset(1.0 - y, x);
+        case 270:
+          return Offset(y, 1.0 - x);
+        case 180:
+          return Offset(1.0 - x, 1.0 - y);
+        default:
+          return Offset(x, y);
+      }
+    }
+
+    final wrist = transformLm(hand.landmarks[0].x, hand.landmarks[0].y);
+    final indexMcp = transformLm(hand.landmarks[5].x, hand.landmarks[5].y);
+    final middleMcp = transformLm(hand.landmarks[9].x, hand.landmarks[9].y);
+    final pinkyMcp = transformLm(hand.landmarks[17].x, hand.landmarks[17].y);
+    final indexTip = transformLm(hand.landmarks[8].x, hand.landmarks[8].y);
+    final middleTip = transformLm(hand.landmarks[12].x, hand.landmarks[12].y);
+
+    // ── Spread check ──
+    final mcpXs = [indexMcp.dx, middleMcp.dx, pinkyMcp.dx];
+    final mcpYs = [indexMcp.dy, middleMcp.dy, pinkyMcp.dy];
     final spreadX = mcpXs.reduce(max) - mcpXs.reduce(min);
     final spreadY = mcpYs.reduce(max) - mcpYs.reduce(min);
     final spread = max(spreadX, spreadY);
-
     if (spread < 0.15) return 'Buka jari lebih lebar';
 
-    final wristY = hand.landmarks[0].y;
-    final avgMcpY =
-        mcpIndices.map((i) => hand.landmarks[i].y).reduce((a, b) => a + b) / 4;
-    if (wristY < avgMcpY) return 'Balikkan telapak menghadap kamera';
+    // ── Telapak menghadap kamera ──
+    final avgMcpY = (indexMcp.dy + middleMcp.dy + pinkyMcp.dy) / 3;
+    if (wrist.dy < avgMcpY) return 'Balikkan telapak menghadap kamera';
 
-    final indexTipY = hand.landmarks[8].y;
-    final indexMcpY = hand.landmarks[5].y;
-    final middleTipY = hand.landmarks[12].y;
-    final middleMcpY = hand.landmarks[9].y;
-    if (indexTipY > indexMcpY && middleTipY > middleMcpY) {
-      return 'Luruskan jari-jari tangan';
+    // ── Jari melipat (dengan toleransi) ──
+    const fingerBendThreshold = 0.06;
+    final indexBent = (indexTip.dy - indexMcp.dy) > fingerBendThreshold;
+    final middleBent = (middleTip.dy - middleMcp.dy) > fingerBendThreshold;
+    if (indexBent && middleBent) return 'Luruskan jari-jari tangan';
+
+    // ── Angle check (sudah pakai koordinat transformed) ──
+    final handAngle =
+        atan2(middleMcp.dx - wrist.dx, -(middleMcp.dy - wrist.dy)) * 180 / pi;
+
+    debugPrint('[PalmGuide] handAngle=${handAngle.toStringAsFixed(1)}° so=$so');
+
+    if (handAngle.abs() > 12) {
+      final arah = handAngle > 0 ? 'ke kiri' : 'ke kanan';
+      final deg = handAngle.abs().toStringAsFixed(0);
+      return 'Miringkan tangan $arah ($deg°)';
     }
 
-    final indexMcpX = hand.landmarks[5].x;
-    final indexMcpYval = hand.landmarks[5].y;
-    final pinkyMcpX = hand.landmarks[17].x;
-    final pinkyMcpY = hand.landmarks[17].y;
-
-    final palmWidth = sqrt(
-      pow(pinkyMcpX - indexMcpX, 2) + pow(pinkyMcpY - indexMcpYval, 2),
-    );
+    // ── Jarak (palmWidth sudah di koordinat normalized 0-1) ──
+    final vx = pinkyMcp.dx - indexMcp.dx;
+    final vy = pinkyMcp.dy - indexMcp.dy;
+    final palmWidth = sqrt(vx * vx + vy * vy);
 
     if (palmWidth >= 0.05) {
       _palmHHistory.add(palmWidth);
-      if (_palmHHistory.length > _palmHWindowSize) {
-        _palmHHistory.removeAt(0);
-      }
+      if (_palmHHistory.length > _palmHWindowSize) _palmHHistory.removeAt(0);
     }
 
     final smoothedWidth = _palmHHistory.isNotEmpty
@@ -238,7 +303,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         : palmWidth;
 
     debugPrint(
-      '[PalmGuide] raw=$palmWidth smoothed=$smoothedWidth spread=$spread wristY=$wristY avgMcpY=$avgMcpY',
+      '[PalmGuide] palmWidth=$smoothedWidth spread=$spread angle=$handAngle',
     );
 
     if (smoothedWidth > 0.40) return 'Terlalu dekat — mundurkan tangan';
@@ -276,11 +341,15 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         return;
       }
 
-      final hand = _detectedHands!.first;
-      final List<List<double>> lmXY = hand.landmarks
-          .map((lm) => [lm.x, lm.y])
-          .toList();
-
+      final List<List<double>> lmXY = _getSmoothedLandmarks();
+      if (lmXY.isEmpty || _landmarkHistory.length < 3) {
+        await _safeStartStream();
+        setState(() {
+          _isTakingPhoto = false;
+          _qualityMessage = 'Stabilkan posisi tangan dulu.';
+        });
+        return;
+      }
       final args = _PhotoProcessArgs(
         rawBytes: rawBytes,
         landmarkXY: lmXY,
@@ -608,19 +677,17 @@ Future<_PhotoProcessResult> _processPhotoInIsolate(
   // 2. Resize ke max 1080px
   img.Image resized = _resizeKeepAspectStatic(fullImage, maxSize: 1080);
 
-  // 3. Crop ROI 200×200 berdasarkan palm center landmark
-  final img.Image? croppedRegion = _cropByLandmarkStatic(
-    resized,
-    args.landmarkXY,
-    args.sensorOrientation,
+  // 3. Crop ROI 128 x 128 berdasarkan palm center landmark
+  final img.Image? croppedRegion = cropByLandmarkRoiMediapipe(
+  resized, args.landmarkXY, args.sensorOrientation,
   );
 
-  if (croppedRegion == null) {
-    return _PhotoProcessResult(
-      errorMessage:
-          'Gagal membaca area tangan.\nPastikan telapak terlihat jelas.',
-    );
-  }
+    if (croppedRegion == null) {
+      return _PhotoProcessResult(
+        errorMessage:
+            'Gagal membaca area tangan.\nPastikan telapak terlihat jelas.',
+      );
+    }
 
   // 4. Quality check pada crop
   final String? qualityError = _checkQualityStatic(croppedRegion);
@@ -629,14 +696,7 @@ Future<_PhotoProcessResult> _processPhotoInIsolate(
   }
 
   // 5. Pastikan 200×200 grayscale lalu encode JPEG
-  final img.Image roi200 = img.copyResize(
-    croppedRegion,
-    width: 200,
-    height: 200,
-    interpolation: img.Interpolation.linear,
-  );
-  final img.Image roiGray = img.grayscale(roi200);
-  final Uint8List jpegBytes = img.encodeJpg(roiGray, quality: 95) as Uint8List;
+  final Uint8List jpegBytes = img.encodeJpg(croppedRegion!, quality: 95) as Uint8List;
 
   final String b64 = base64Encode(jpegBytes);
   return _PhotoProcessResult(filePath: b64);
@@ -680,55 +740,60 @@ img.Image? _cropByLandmarkStatic(
     }
 
     final wrist = transformLm(lmXY[0][0], lmXY[0][1]);
-    final middleMcp = transformLm(lmXY[9][0], lmXY[9][1]);
     final indexMcp = transformLm(lmXY[5][0], lmXY[5][1]);
+    final middleMcp = transformLm(lmXY[9][0], lmXY[9][1]);
+    final ringMcp = transformLm(lmXY[13][0], lmXY[13][1]);
     final pinkyMcp = transformLm(lmXY[17][0], lmXY[17][1]);
 
-    // ── 1. Hitung angle (sebelum rotasi apapun) ──
+    // ── 1. Angle: wrist→middleMcp terhadap sumbu Y, clamp ±5° (sinkron server) ──
     final dx = middleMcp.dx - wrist.dx;
     final dy = middleMcp.dy - wrist.dy;
     double angle = atan2(dx, -dy) * 180 / pi;
-    angle = angle.clamp(-100.0, 100.0);
-    debugPrint('[Crop] Computed angle: $angle');
+    angle = angle.clamp(-5.0, 5.0); // sinkron dengan ALIGN_ANGLE_MAX server
 
-    // ── 2. Dynamic ROI size dari landmark ASLI (sebelum rotasi) ──
-    final distWristMid = sqrt(pow(dx, 2) + pow(dy, 2));
-    final dynamicSize = (distWristMid * 0.70).clamp(80.0, 200.0);
+    // ── 2. Dynamic ROI size: knuckleDist × 1.15 (sinkron server)
+    final knuckleDist = sqrt(
+      pow(pinkyMcp.dx - indexMcp.dx, 2) + pow(pinkyMcp.dy - indexMcp.dy, 2),
+    );
+    final dynamicSize = (knuckleDist * 1.15).clamp(80.0, 200.0);
 
-    // ── 3. Palm center dari landmark ASLI (offset 0.40) ──
+    // ── 3. Palm center: anchor = avg 4 MCP, offset 0.52 (sinkron server) ──
+    final anchorX = (indexMcp.dx + middleMcp.dx + ringMcp.dx + pinkyMcp.dx) / 4;
+    final anchorY = (indexMcp.dy + middleMcp.dy + ringMcp.dy + pinkyMcp.dy) / 4;
+
     final vx = pinkyMcp.dx - indexMcp.dx;
     final vy = pinkyMcp.dy - indexMcp.dy;
     final palmWidth = sqrt(vx * vx + vy * vy);
     if (palmWidth < 1) return null;
 
-    final midX = (indexMcp.dx + pinkyMcp.dx) / 2;
-    final midY = (indexMcp.dy + pinkyMcp.dy) / 2;
-
     var nx = -vy / palmWidth;
     var ny = vx / palmWidth;
 
-    final wx = wrist.dx - midX;
-    final wy = wrist.dy - midY;
+    // Pastikan normal mengarah ke wrist
+    final wx = wrist.dx - anchorX;
+    final wy = wrist.dy - anchorY;
     if (nx * wx + ny * wy < 0) {
       nx = -nx;
       ny = -ny;
     }
 
-    final offset = palmWidth * 0.40;
-    final pcx = midX + nx * offset;
-    final pcy = midY + ny * offset;
+    final offset = palmWidth * 0.52;
+    final pcx = anchorX + nx * offset;
+    final pcy = anchorY + ny * offset;
 
-    // ── 4. Crop area BESAR (1.6× dynamicSize) di sekitar palm center ──
-    // Agar telapak tetap masuk meski gambar dirotasi sampai ±25°
-    final bigSize = (dynamicSize * 1.6).clamp(80.0, min(w, h));
+    debugPrint(
+      '[Crop] pcx=${pcx.toStringAsFixed(1)} pcy=${pcy.toStringAsFixed(1)} '
+      'dynamicSize=${dynamicSize.toStringAsFixed(1)} '
+      'knuckleDist=${knuckleDist.toStringAsFixed(1)} '
+      'offset=${offset.toStringAsFixed(1)} '
+      'angle=${angle.toStringAsFixed(1)}°',
+    );
+
+    // ── 4. Crop area besar di sekitar palm center ──
+    final bigSize = (dynamicSize * 1.2).clamp(80.0, min(w, h));
     final bigHalf = bigSize / 2;
 
-    if (w < bigSize || h < bigSize) {
-      debugPrint(
-        '[Crop] Gambar terlalu kecil untuk bigSize=$bigSize: ${w}x${h}',
-      );
-      return null;
-    }
+    if (w < bigSize || h < bigSize) return null;
 
     final bx1 = (pcx - bigHalf).clamp(0.0, w - bigSize);
     final by1 = (pcy - bigHalf).clamp(0.0, h - bigSize);
@@ -741,22 +806,15 @@ img.Image? _cropByLandmarkStatic(
       height: bigSize.toInt(),
     );
 
-    // ── 5. Rotasi crop besar (persegi, jadi ambiguitas pivot minim) ──
-    // Asumsi: angle positif → tangan miring ke kanan → perlu rotasi
-    // berlawanan arah jarum jam agar tegak.
-    // img.copyRotate dengan angle positif = searah jarum jam,
-    // jadi pakai -angle agar berlawanan jarum jam.
+    // ── 5. Rotasi agar jari mengarah ke atas ──
     final img.Image rotated = img.copyRotate(bigCrop, angle: -angle);
 
-    // ── 6. Crop tengah dari hasil rotasi ke ukuran dynamicSize ──
+    // ── 6. Crop tengah ke dynamicSize ──
     final rw = rotated.width.toDouble();
     final rh = rotated.height.toDouble();
     final half = dynamicSize / 2;
 
-    if (rw < dynamicSize || rh < dynamicSize) {
-      debugPrint('[Crop] Hasil rotasi terlalu kecil: ${rw}x${rh}');
-      return null;
-    }
+    if (rw < dynamicSize || rh < dynamicSize) return null;
 
     final cx1 = (rw / 2 - half).clamp(0.0, rw - dynamicSize);
     final cy1 = (rh / 2 - half).clamp(0.0, rh - dynamicSize);
@@ -777,8 +835,7 @@ img.Image? _cropByLandmarkStatic(
       interpolation: img.Interpolation.average,
     );
   } catch (e, stack) {
-    debugPrint('[Crop] Error: $e');
-    debugPrint('[Crop] Stack: $stack');
+    debugPrint('[Crop] Error: $e\n$stack');
     return null;
   }
 }

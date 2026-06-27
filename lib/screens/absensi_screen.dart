@@ -91,10 +91,6 @@ class _AbsensiScreenState extends State<AbsensiScreen> {
                 style: const TextStyle(color: Colors.grey),
               ),
               const SizedBox(height: 8),
-              Text(
-                'Similarity: ${(result['similarity'] * 100).toStringAsFixed(1)}%',
-                style: const TextStyle(color: Colors.grey, fontSize: 12),
-              ),
             ],
           ),
           actions: [

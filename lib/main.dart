@@ -1,3 +1,4 @@
+import 'package:absensi_palmprint_fe/screens/home_menu_screen.dart';
 import 'package:flutter/material.dart';
 import 'screens/login_screen.dart';
 
@@ -17,7 +18,7 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
         useMaterial3: true,
       ),
-      home: const LoginScreen(),
+      home: const HomeMenuScreen(),
     );
   }
 }

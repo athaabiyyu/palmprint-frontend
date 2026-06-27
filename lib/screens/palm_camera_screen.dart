@@ -49,6 +49,10 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   bool _qualityOk = false;
   String _palmGuideMessage = 'Arahkan telapak tangan ke kamera...';
 
+  DateTime? _handDetectedSince;
+  static const Duration _autoCaptureDelay = Duration(seconds: 2);
+  int _autoCountdown = 2;
+
   static const double _roiRatio = 0.95;
 
   @override
@@ -134,13 +138,13 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         return;
       }
 
-      final backCamera = _cameras.firstWhere(
-        (c) => c.lensDirection == CameraLensDirection.back,
+      final frontCamera = _cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
         orElse: () => _cameras.first,
       );
 
       _controller = CameraController(
-        backCamera,
+        frontCamera,
         ResolutionPreset.high, // ← turun dari veryHigh, decode lebih cepat
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
@@ -196,11 +200,35 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 
             final issue = _checkPalmGuide(hands.first);
             _handDetected = (issue == null);
-            _palmGuideMessage = issue ?? 'Tangan terdeteksi ✓ Siap ambil foto';
+
+            if (_handDetected) {
+              _handDetectedSince ??= DateTime.now();
+              final held = DateTime.now().difference(_handDetectedSince!);
+              final remaining = (_autoCaptureDelay - held).inSeconds.clamp(
+                0,
+                2,
+              );
+              _autoCountdown = remaining;
+
+              if (held >= _autoCaptureDelay && !_isTakingPhoto) {
+                _palmGuideMessage = 'Mengambil foto...';
+                Future.microtask(() => _takePhoto());
+              } else {
+                _palmGuideMessage = remaining > 0
+                    ? 'Tahan posisi... $remaining detik'
+                    : 'Mengambil foto...';
+              }
+            } else {
+              _handDetectedSince = null;
+              _autoCountdown = 2;
+              _palmGuideMessage =
+                  issue ?? 'Arahkan telapak tangan ke kamera...';
+            }
           } else {
             if (hands.isEmpty) {
               _handDetected = false;
-              // HAPUS: _landmarkHistory.clear(); ← ini penyebabnya
+              _handDetectedSince = null;
+              _autoCountdown = 2;
               _palmGuideMessage = 'Arahkan telapak tangan ke kamera...';
             }
           }
@@ -239,15 +267,22 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 
     // Helper transform — sama persis dengan yang di crop
     Offset transformLm(double x, double y) {
+      Offset result;
       switch (so) {
         case 90:
-          return Offset(1.0 - y, x);
+          result = Offset(1.0 - y, x);
+          // Flip untuk SO=90 front camera
+          return Offset(1.0 - result.dx, result.dy);
         case 270:
-          return Offset(y, 1.0 - x);
+          result = Offset(y, 1.0 - x);
+          // SO=270 front camera: tidak perlu flip
+          return result;
         case 180:
-          return Offset(1.0 - x, 1.0 - y);
+          result = Offset(1.0 - x, 1.0 - y);
+          return Offset(1.0 - result.dx, result.dy);
         default:
-          return Offset(x, y);
+          result = Offset(x, y);
+          return Offset(1.0 - result.dx, result.dy);
       }
     }
 
@@ -283,7 +318,7 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     debugPrint('[PalmGuide] handAngle=${handAngle.toStringAsFixed(1)}° so=$so');
 
     if (handAngle.abs() > 12) {
-      final arah = handAngle > 0 ? 'ke kiri' : 'ke kanan';
+      final arah = handAngle > 0 ? 'ke kanan' : 'ke kiri';
       final deg = handAngle.abs().toStringAsFixed(0);
       return 'Miringkan tangan $arah ($deg°)';
     }
@@ -350,6 +385,12 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
         });
         return;
       }
+      debugPrint(
+        '[Camera] sensorOrientation=${_controller!.description.sensorOrientation}',
+      );
+      debugPrint(
+        '[Camera] lensDirection=${_controller!.description.lensDirection}',
+      );
       final args = _PhotoProcessArgs(
         rawBytes: rawBytes,
         landmarkXY: lmXY,
@@ -553,54 +594,37 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                 ),
               ),
 
-            if (_isInitialized)
+            if (_isInitialized && _handDetected)
               Positioned(
                 bottom: 24,
                 left: 0,
                 right: 0,
                 child: Center(
-                  child: GestureDetector(
-                    onTap: (_isTakingPhoto || !_handDetected)
-                        ? null
-                        : _takePhoto,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 150),
-                      width: _isTakingPhoto ? 64 : 72,
-                      height: _isTakingPhoto ? 64 : 72,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: _isTakingPhoto
-                            ? Colors.grey
-                            : _handDetected
-                            ? Colors.white
-                            : Colors.grey.shade600,
-                        border: Border.all(color: Colors.white54, width: 4),
-                        boxShadow: [
-                          BoxShadow(
-                            color: _handDetected
-                                ? Colors.white.withOpacity(0.3)
-                                : Colors.transparent,
-                            blurRadius: 12,
-                            spreadRadius: 2,
-                          ),
-                        ],
+                  child: Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      SizedBox(
+                        width: 72,
+                        height: 72,
+                        child: CircularProgressIndicator(
+                          value: _isTakingPhoto
+                              ? 1.0
+                              : (_autoCaptureDelay.inSeconds - _autoCountdown) /
+                                    _autoCaptureDelay.inSeconds,
+                          strokeWidth: 4,
+                          color: Colors.greenAccent,
+                          backgroundColor: Colors.white24,
+                        ),
                       ),
-                      child: _isTakingPhoto
-                          ? const Padding(
-                              padding: EdgeInsets.all(16),
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
-                              ),
-                            )
-                          : Icon(
-                              Icons.camera_alt,
-                              color: _handDetected
-                                  ? Colors.black87
-                                  : Colors.white54,
-                              size: 32,
-                            ),
-                    ),
+                      Text(
+                        _isTakingPhoto ? '📸' : '$_autoCountdown',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 24,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -670,6 +694,7 @@ Future<_PhotoProcessResult> _processPhotoInIsolate(
 ) async {
   // 1. Decode
   img.Image? fullImage = img.decodeImage(args.rawBytes);
+  debugPrint('[Isolate] imageSize=${fullImage?.width}x${fullImage?.height}');
   if (fullImage == null) {
     return _PhotoProcessResult(errorMessage: 'Gagal decode gambar');
   }
@@ -679,15 +704,18 @@ Future<_PhotoProcessResult> _processPhotoInIsolate(
 
   // 3. Crop ROI 128 x 128 berdasarkan palm center landmark
   final img.Image? croppedRegion = cropByLandmarkRoiMediapipe(
-  resized, args.landmarkXY, args.sensorOrientation,
+    resized,
+    args.landmarkXY,
+    args.sensorOrientation,
+    isFrontCamera: true,
   );
 
-    if (croppedRegion == null) {
-      return _PhotoProcessResult(
-        errorMessage:
-            'Gagal membaca area tangan.\nPastikan telapak terlihat jelas.',
-      );
-    }
+  if (croppedRegion == null) {
+    return _PhotoProcessResult(
+      errorMessage:
+          'Gagal membaca area tangan.\nPastikan telapak terlihat jelas.',
+    );
+  }
 
   // 4. Quality check pada crop
   final String? qualityError = _checkQualityStatic(croppedRegion);
@@ -696,7 +724,8 @@ Future<_PhotoProcessResult> _processPhotoInIsolate(
   }
 
   // 5. Pastikan 200×200 grayscale lalu encode JPEG
-  final Uint8List jpegBytes = img.encodeJpg(croppedRegion!, quality: 95) as Uint8List;
+  final Uint8List jpegBytes =
+      img.encodeJpg(croppedRegion!, quality: 95) as Uint8List;
 
   final String b64 = base64Encode(jpegBytes);
   return _PhotoProcessResult(filePath: b64);
@@ -932,86 +961,91 @@ class _ROIPainter extends CustomPainter {
   });
 
   Offset _transformLandmark(double x, double y, Size size) {
+    Offset result;
     switch (sensorOrientation) {
       case 90:
-        return Offset((1.0 - y) * size.width, x * size.height);
+        result = Offset((1.0 - y) * size.width, x * size.height);
+        break;
       case 270:
-        return Offset(y * size.width, (1.0 - x) * size.height);
+        result = Offset(y * size.width, (1.0 - x) * size.height);
+        break;
       case 180:
-        return Offset((1.0 - x) * size.width, (1.0 - y) * size.height);
+        result = Offset((1.0 - x) * size.width, (1.0 - y) * size.height);
+        break;
       default:
-        return Offset(x * size.width, y * size.height);
+        result = Offset(x * size.width, y * size.height);
     }
+    return Offset(size.width - result.dx, result.dy);
   }
 
   @override
   void paint(Canvas canvas, Size size) {
-    final boxSize = size.width * roiRatio;
-    final left = (size.width - boxSize) / 2;
-    final top = (size.height - boxSize) / 2 - size.height * 0.08;
-    final rect = Rect.fromLTWH(left, top, boxSize, boxSize);
+    // final boxSize = size.width * roiRatio;
+    // final left = (size.width - boxSize) / 2;
+    // final top = (size.height - boxSize) / 2 - size.height * 0.08;
+    // final rect = Rect.fromLTWH(left, top, boxSize, boxSize);
 
-    final overlayPath = Path()
-      ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
-      ..addRect(rect)
-      ..fillType = PathFillType.evenOdd;
-    canvas.drawPath(
-      overlayPath,
-      Paint()..color = Colors.black.withOpacity(0.55),
-    );
+    // final overlayPath = Path()
+    //   ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
+    //   ..addRect(rect)
+    //   ..fillType = PathFillType.evenOdd;
+    // canvas.drawPath(
+    //   overlayPath,
+    //   Paint()..color = Colors.black.withOpacity(0.55),
+    // );
 
-    final borderColor = handDetected ? Colors.greenAccent : Colors.white;
-    canvas.drawRect(
-      rect,
-      Paint()
-        ..color = borderColor
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2.5,
-    );
+    // final borderColor = handDetected ? Colors.greenAccent : Colors.white;
+    // canvas.drawRect(
+    //   rect,
+    //   Paint()
+    //     ..color = borderColor
+    //     ..style = PaintingStyle.stroke
+    //     ..strokeWidth = 2.5,
+    // );
 
-    final cornerPaint = Paint()
-      ..color = handDetected ? Colors.greenAccent : Colors.lightBlueAccent
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round;
+    // final cornerPaint = Paint()
+    //   ..color = handDetected ? Colors.greenAccent : Colors.lightBlueAccent
+    //   ..style = PaintingStyle.stroke
+    //   ..strokeWidth = 4
+    //   ..strokeCap = StrokeCap.round;
 
-    const cLen = 24.0;
-    canvas.drawLine(Offset(left, top + cLen), Offset(left, top), cornerPaint);
-    canvas.drawLine(Offset(left, top), Offset(left + cLen, top), cornerPaint);
-    canvas.drawLine(
-      Offset(left + boxSize - cLen, top),
-      Offset(left + boxSize, top),
-      cornerPaint,
-    );
-    canvas.drawLine(
-      Offset(left + boxSize, top),
-      Offset(left + boxSize, top + cLen),
-      cornerPaint,
-    );
-    canvas.drawLine(
-      Offset(left, top + boxSize - cLen),
-      Offset(left, top + boxSize),
-      cornerPaint,
-    );
-    canvas.drawLine(
-      Offset(left, top + boxSize),
-      Offset(left + cLen, top + boxSize),
-      cornerPaint,
-    );
-    canvas.drawLine(
-      Offset(left + boxSize - cLen, top + boxSize),
-      Offset(left + boxSize, top + boxSize),
-      cornerPaint,
-    );
-    canvas.drawLine(
-      Offset(left + boxSize, top + boxSize - cLen),
-      Offset(left + boxSize, top + boxSize),
-      cornerPaint,
-    );
+    // const cLen = 24.0;
+    // canvas.drawLine(Offset(left, top + cLen), Offset(left, top), cornerPaint);
+    // canvas.drawLine(Offset(left, top), Offset(left + cLen, top), cornerPaint);
+    // canvas.drawLine(
+    //   Offset(left + boxSize - cLen, top),
+    //   Offset(left + boxSize, top),
+    //   cornerPaint,
+    // );
+    // canvas.drawLine(
+    //   Offset(left + boxSize, top),
+    //   Offset(left + boxSize, top + cLen),
+    //   cornerPaint,
+    // );
+    // canvas.drawLine(
+    //   Offset(left, top + boxSize - cLen),
+    //   Offset(left, top + boxSize),
+    //   cornerPaint,
+    // );
+    // canvas.drawLine(
+    //   Offset(left, top + boxSize),
+    //   Offset(left + cLen, top + boxSize),
+    //   cornerPaint,
+    // );
+    // canvas.drawLine(
+    //   Offset(left + boxSize - cLen, top + boxSize),
+    //   Offset(left + boxSize, top + boxSize),
+    //   cornerPaint,
+    // );
+    // canvas.drawLine(
+    //   Offset(left + boxSize, top + boxSize - cLen),
+    //   Offset(left + boxSize, top + boxSize),
+    //   cornerPaint,
+    // );
 
     if (handDetected && detectedHands != null && detectedHands!.isNotEmpty) {
       final hand = detectedHands!.first;
-      final roiRect = Rect.fromLTWH(left, top, boxSize, boxSize);
+      // final roiRect = Rect.fromLTWH(left, top, boxSize, boxSize);
 
       final linePaint = Paint()
         ..color = Colors.greenAccent.withOpacity(0.5)
@@ -1024,7 +1058,7 @@ class _ROIPainter extends CustomPainter {
 
       Offset lmToOffset(landmark) =>
           _transformLandmark(landmark.x, landmark.y, size);
-      bool isInRoi(Offset p) => roiRect.contains(p);
+      // bool isInRoi(Offset p) => roiRect.contains(p);
 
       final connections = [
         [0, 1],
@@ -1055,16 +1089,12 @@ class _ROIPainter extends CustomPainter {
       for (final conn in connections) {
         final p1 = lmToOffset(hand.landmarks[conn[0]]);
         final p2 = lmToOffset(hand.landmarks[conn[1]]);
-        if (isInRoi(p1) && isInRoi(p2)) {
-          canvas.drawLine(p1, p2, linePaint);
-        }
+        canvas.drawLine(p1, p2, linePaint);
       }
 
       for (final landmark in hand.landmarks) {
         final p = lmToOffset(landmark);
-        if (isInRoi(p)) {
-          canvas.drawCircle(p, 4, dotPaint);
-        }
+        canvas.drawCircle(p, 4, dotPaint);
       }
     }
 
@@ -1080,7 +1110,7 @@ class _ROIPainter extends CustomPainter {
       ),
       textDirection: ui.TextDirection.ltr,
     )..layout();
-    textPainter.paint(canvas, Offset(left + 8, top + 8));
+    textPainter.paint(canvas, const Offset(16, 16));
   }
 
   @override

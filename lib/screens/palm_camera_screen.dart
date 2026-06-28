@@ -913,6 +913,60 @@ String? _checkQualityStatic(img.Image cropped) {
   if (contrast < 6)
     return 'Detail telapak tangan tidak terlihat.\nPastikan telapak menghadap kamera.';
 
+  final dirtyCheck = _checkDirtyHand(gray);
+  if (dirtyCheck != null) return dirtyCheck;
+
+  return null;
+}
+
+String? _checkDirtyHand(img.Image gray) {
+  final w = gray.width;
+  final h = gray.height;
+
+  double totalSum = 0;
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      totalSum += img.getLuminance(gray.getPixel(x, y)).toDouble();
+    }
+  }
+  final globalMean = totalSum / (w * h);
+
+  const blockSize = 4;
+  int suspiciousBlockCount = 0;
+  int totalBlocks = 0;
+
+  for (int by = 0; by + blockSize <= h; by += blockSize) {
+    for (int bx = 0; bx + blockSize <= w; bx += blockSize) {
+      double blockSum = 0;
+      int count = 0;
+      for (int y = by; y < by + blockSize; y++) {
+        for (int x = bx; x < bx + blockSize; x++) {
+          blockSum += img.getLuminance(gray.getPixel(x, y)).toDouble();
+          count++;
+        }
+      }
+      final blockMean = blockSum / count;
+      totalBlocks++;
+
+      final threshold = (globalMean * 0.75).clamp(30.0, 90.0);
+      if (blockMean < threshold && globalMean > 50) {
+        suspiciousBlockCount++;
+      }
+    }
+  }
+
+  final dirtyRatio = suspiciousBlockCount / totalBlocks;
+
+  debugPrint(
+    '[DirtyHand] globalMean=${globalMean.toStringAsFixed(1)} '
+    'suspicious=$suspiciousBlockCount/$totalBlocks '
+    'ratio=${(dirtyRatio * 100).toStringAsFixed(1)}%',
+  );
+
+  if (dirtyRatio > 0.003) {
+    return 'Telapak tangan terdeteksi kotor.\nBersihkan tangan sebelum absensi.';
+  }
+
   return null;
 }
 

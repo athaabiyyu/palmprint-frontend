@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../services/jadwal_service.dart';
+import '../../services/jadwal_service.dart';
 
 class UploadSuratScreen extends StatefulWidget {
   final String token;

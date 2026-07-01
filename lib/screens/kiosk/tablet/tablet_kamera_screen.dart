@@ -1,11 +1,11 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import '../palm_camera_screen.dart';
+import '../../shared/palm_camera_screen.dart';
 import 'tablet_hasil_screen.dart';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
-import '../../config/api_config.dart';
+import '../../../config/api_config.dart';
 
 class TabletKameraScreen extends StatefulWidget {
   final Map<String, dynamic> sesi;

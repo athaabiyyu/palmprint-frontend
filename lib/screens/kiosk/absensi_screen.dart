@@ -2,8 +2,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
-import '../services/jadwal_service.dart';
-import 'palm_camera_screen.dart';
+import '/services/jadwal_service.dart';
+import '../shared/palm_camera_screen.dart';
 
 class AbsensiScreen extends StatefulWidget {
   final String token;

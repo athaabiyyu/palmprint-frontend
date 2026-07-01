@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
-import '../services/jadwal_service.dart';
-import 'absensi_screen.dart';
+import '../../services/jadwal_service.dart';
 import 'riwayat_absensi_screen.dart';
 
 class JadwalScreen extends StatefulWidget {
@@ -140,19 +139,7 @@ class _JadwalScreenState extends State<JadwalScreen> {
                                 sesiAktif: sesiAktif,
                                 sudahAbsen: sudahAbsen,
                                 onAbsen: () async {
-                                  await Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => AbsensiScreen(
-                                        token: widget.token,
-                                        mahasiswa: widget.mahasiswa,
-                                        sesiAbsensiId: sesiAktif['id'],
-                                        namaMatkul:
-                                            jadwal['mata_kuliah']['nama'],
-                                      ),
-                                    ),
-                                  );
-                                  _loadJadwal(); // refresh setelah absen
+                                  
                                 },
                               );
                             }, childCount: _jadwals.length),

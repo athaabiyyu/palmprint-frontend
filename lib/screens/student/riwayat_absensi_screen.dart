@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../services/jadwal_service.dart';
+import '../../services/jadwal_service.dart';
 import 'upload_surat_screen.dart';
 
 class RiwayatAbsensiScreen extends StatefulWidget {

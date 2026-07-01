@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'dart:ui' as ui;
-import 'package:absensi_palmprint_fe/roi_crop_flutter.dart';
+import 'roi_crop_flutter.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:hand_landmarker/hand_landmarker.dart';
@@ -910,7 +910,7 @@ String? _checkQualityStatic(img.Image cropped) {
     return 'Foto terlalu gelap.\nPindah ke tempat yang lebih terang.';
   if (brightness > 230)
     return 'Foto terlalu terang.\nHindari cahaya langsung ke kamera.';
-  if (contrast < 6)
+  if (contrast < 2)
     return 'Detail telapak tangan tidak terlihat.\nPastikan telapak menghadap kamera.';
 
   final dirtyCheck = _checkDirtyHand(gray);
@@ -963,7 +963,7 @@ String? _checkDirtyHand(img.Image gray) {
     'ratio=${(dirtyRatio * 100).toStringAsFixed(1)}%',
   );
 
-  if (dirtyRatio > 0.003) {
+  if (dirtyRatio > 0.301) {
     return 'Telapak tangan terdeteksi kotor.\nBersihkan tangan sebelum absensi.';
   }
 

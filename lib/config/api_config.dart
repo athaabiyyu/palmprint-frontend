@@ -1,7 +1,7 @@
 class ApiConfig {
   // static const String baseUrl = 'https://overtone-reversion-prevent.ngrok-free.dev/api';
   static const String baseUrl =
-      'http://172.20.10.2:8000/api';
+      'http://192.168.1.15:8000/api';
 
   // ==================== HEADERS ====================
 

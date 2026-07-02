@@ -11,6 +11,7 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
+import 'package:screen_brightness/screen_brightness.dart';
 
 class PalmCameraScreen extends StatefulWidget {
   final int fotoIndex;
@@ -32,6 +33,8 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
   List<CameraDescription> _cameras = [];
   bool _isInitialized = false;
   bool _isTakingPhoto = false;
+  bool _showWhiteOverlay = false;
+  double? _originalBrightness;
 
   HandLandmarkerPlugin? _handLandmarker;
   bool _isDetecting = false;
@@ -359,13 +362,31 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
     });
 
     try {
+      _originalBrightness = await ScreenBrightness().current;
+      await ScreenBrightness().setScreenBrightness(1.0);
+      setState(() => _showWhiteOverlay = true);
+      await Future.delayed(const Duration(milliseconds: 250));
+    } catch (e) {
+      debugPrint('[ScreenFlash] gagal set brightness: $e');
+    }
+
+    try {
       _safeStopStream();
       await Future.delayed(const Duration(milliseconds: 100));
 
       final XFile xfile = await _controller!.takePicture();
       final Uint8List rawBytes = await xfile.readAsBytes();
 
+      setState(() => _showWhiteOverlay = false);
+      if (_originalBrightness != null) {
+        await ScreenBrightness().setScreenBrightness(_originalBrightness!);
+      }
+
       if (_detectedHands == null || _detectedHands!.isEmpty) {
+        setState(() => _showWhiteOverlay = false);
+        if (_originalBrightness != null) {
+          await ScreenBrightness().setScreenBrightness(_originalBrightness!);
+        }
         await _safeStartStream();
         setState(() {
           _isTakingPhoto = false;
@@ -378,6 +399,10 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
 
       final List<List<double>> lmXY = _getSmoothedLandmarks();
       if (lmXY.isEmpty || _landmarkHistory.length < 3) {
+        setState(() => _showWhiteOverlay = false);
+        if (_originalBrightness != null) {
+          await ScreenBrightness().setScreenBrightness(_originalBrightness!);
+        }
         await _safeStartStream();
         setState(() {
           _isTakingPhoto = false;
@@ -400,6 +425,10 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
       final result = await compute(_processPhotoInIsolate, args);
 
       if (result.errorMessage != null) {
+        setState(() => _showWhiteOverlay = false);
+        if (_originalBrightness != null) {
+          await ScreenBrightness().setScreenBrightness(_originalBrightness!);
+        }
         await _safeStartStream();
         setState(() {
           _isTakingPhoto = false;
@@ -427,6 +456,10 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
       if (mounted) Navigator.of(context).pop(outFile);
     } catch (e) {
       _showError('Gagal mengambil foto: $e');
+      setState(() => _showWhiteOverlay = false);
+      if (_originalBrightness != null) {
+        await ScreenBrightness().setScreenBrightness(_originalBrightness!);
+      }
       await _safeStartStream();
       setState(() => _isTakingPhoto = false);
     }
@@ -628,6 +661,8 @@ class _PalmCameraScreenState extends State<PalmCameraScreen>
                   ),
                 ),
               ),
+            if (_showWhiteOverlay)
+              const Positioned.fill(child: ColoredBox(color: Colors.white)),
           ],
         ),
       ),
@@ -906,11 +941,11 @@ String? _checkQualityStatic(img.Image cropped) {
   );
   if (blurScore < 8)
     return 'Foto terlalu blur.\nPastikan kamera fokus dan tangan tidak bergerak.';
-  if (brightness < 40)
+  if (brightness < 30)
     return 'Foto terlalu gelap.\nPindah ke tempat yang lebih terang.';
-  if (brightness > 230)
+  if (brightness > 235)
     return 'Foto terlalu terang.\nHindari cahaya langsung ke kamera.';
-  if (contrast < 2)
+  if (contrast < 6)
     return 'Detail telapak tangan tidak terlihat.\nPastikan telapak menghadap kamera.';
 
   final dirtyCheck = _checkDirtyHand(gray);
